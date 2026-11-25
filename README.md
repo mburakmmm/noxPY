@@ -5,14 +5,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.15+](https://img.shields.io/badge/Python-3.15%2B-3776AB.svg)](https://docs.python.org/3.15/)
 [![ABI: abi3t](https://img.shields.io/badge/ABI-abi3t%20%28free--threaded%29-2EA44F.svg)](docs/adr/0001-cpython-315-dual-abi3t.md)
-[![Phase: 0 Complete -> 1 Ready](https://img.shields.io/badge/Phase-0%20Complete%20%E2%86%92%201%20Ready-brightgreen.svg)](TODO.md)
+[![Phase: 1 Verified (0.1 alpha) -> Phase 2 Next](https://img.shields.io/badge/Phase-1%20Verified%20%280.1a%29-blue.svg)](TODO.md)
 
 **Native Python extensions written in [Nox](https://github.com/mburakmmm/nox-lang). Free-threaded first (`abi3t`), safe by design.**
 
 NoxPy combines a native CPython 3.15+ binding layer and a PEP 517/660 build pipeline so developers can author typed Nox modules, compile platform wheels targeting `cp315-abi3.abi3t`, and import them in both ordinary CPython 3.15 and free-threaded CPython `3.15t` without requiring wheel consumers to install `noxc`, Zig, or a C compiler.
 
-> **Current Status (Phase 0 Exit Verified on `noxc v2.2.81` + `CPython 3.15.2` & unforced `3.15t`):**
-> All 7 upstream requirements ([`UR-001`–`UR-007`](UPSTREAM_REQUIREMENTS.md)) are resolved in `nox-lang v2.2.75`–`v2.2.81` (`include/nox_host.h` v1, `--host-abi`, `--emit-obj`/`--emit-shared-lib`, `bytes`, `noxc expand --json`). The experimental `--selfhost-obj` bridge is retired, bounded per-module `NoxHostContext` pooling runs in parallel across `3.15.2` and unforced `3.15t`, and **Phase 1 (`0.1 alpha`: PEP 517 wheel builder)** is ready to begin.
+> **Current Status (Phase 1 `0.1 alpha` Functions & Wheels Verified on macOS arm64):**
+> Built dual-tag `cp315-abi3.abi3t-macosx_14_0_arm64.whl` wheels for [`examples/hello`](examples/hello/) and [`examples/fastmath`](examples/fastmath/) using `noxc v2.2.81` (`--host-abi`), installed them into isolated `CPython 3.15.2` and unforced `3.15.0b3t` virtualenvs (`gil_enabled=False`) with zero compiler tools on `PATH`, and verified positional/keyword calls, binary-safe `str`/`bytes`, `ValueError` containment, and 8-thread concurrency. Next: Phase 2 (collections, `T | None`, sdist, PEP 660 editable installs).
 
 ---
 
@@ -43,7 +43,7 @@ Design charter & normative invariants live in [`AGENTS.md`](AGENTS.md):
 | Phase 0 End-to-End Host ABI Suite ([`experiments/phase0_poc/`](experiments/phase0_poc/)) | **Verified** | Genuine `@export` Nox modules built via `--host-abi` (`include/nox_host.h`), concurrent `1/2/4/8` threads (`peak_in_flight=8`), dual-library isolation, `\0`-safe `str`/`bytes`, `ValueError` inspection, `NoxHostHandle` lifecycle |
 | Upstream Contract Verification ([`tests/reproducers/`](tests/reproducers/)) | **Verified (`7/7`)** | `UR-001`–`UR-007` positively verified against `noxc v2.2.81` (`2dcee335`) |
 | Free-Threaded `python3.15t` Unforced Run | **Verified** | [`test_freethreaded_315t.py`](tests/abi/test_freethreaded_315t.py) passes locally on `3.15.0b3t` (`gil_enabled=False`, `peak_in_flight=8`) and in CI |
-| Production Packaging & Wheels (Phase 1 — `0.1 alpha`) | **Unlocked (Next)** | Phase 0 exit gates satisfied; `python/noxpy/build.py` PEP 517 wheel builder next |
+| Production Packaging & Wheels (Phase 1 — `0.1 alpha`) | **Verified (`macOS arm64`)** | [`noxpy.build`](python/noxpy/build.py) PEP 517 backend, [`noxpy.audit`](python/noxpy/audit.py), `noxpy new/build/develop`, `examples/hello` & `examples/fastmath` dual-tag wheels tested in clean `3.15.2` & `3.15t` venvs |
 
 ---
 

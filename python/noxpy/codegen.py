@@ -85,6 +85,13 @@ _C_RET_VAR_MAP = {
 }
 
 
+_PARAM_KIND_MACRO = {
+    "positional_only": "NOXPY_PARAM_POS_ONLY",
+    "positional_or_keyword": "NOXPY_PARAM_POS_OR_KW",
+    "keyword_only": "NOXPY_PARAM_KW_ONLY",
+}
+
+
 def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines: list[str] = []
     c_params = ["NoxHostContext *ctx"]
@@ -100,13 +107,29 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
 
     lines.append(f"extern NoxHostStatus {fn.c_symbol}({', '.join(c_params)});")
     lines.append("")
-    lines.append(f"static PyObject *noxpy_wrap_{fn.name}(PyObject *module, PyObject *const *args, Py_ssize_t nargs) {{")
-    lines.append(f"    if (nargs != {len(fn.params)}) {{")
     lines.append(
-        f'        PyErr_Format(PyExc_TypeError, "{fn.name}() takes exactly {len(fn.params)} argument(s) (%zd given)", nargs);'
+        f"static PyObject *noxpy_wrap_{fn.name}(PyObject *module, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {{"
     )
-    lines.append("        return NULL;")
-    lines.append("    }")
+    argc = len(fn.params)
+    if argc == 0:
+        lines.append("    (void)args;")
+        lines.append("    if (nargs != 0 || (kwnames && PyTuple_Size(kwnames) != 0)) {")
+        lines.append(
+            f'        PyErr_Format(PyExc_TypeError, "{fn.name}() takes 0 argument(s) (%zd positional given)", nargs);'
+        )
+        lines.append("        return NULL;")
+        lines.append("    }")
+    else:
+        lines.append("    static const NoxPyParamSpec params[] = {")
+        for p in fn.params:
+            lines.append(f"        {{ {_c_escape(p.name)}, {_PARAM_KIND_MACRO[p.kind]} }},")
+        lines.append("    };")
+        lines.append(f"    PyObject *bound[{argc}] = {{ NULL }};")
+        lines.append(
+            f"    if (noxpy_bind_fastcall_kwargs({_c_escape(fn.name)}, params, {argc}, args, nargs, kwnames, bound) < 0) {{"
+        )
+        lines.append("        return NULL;")
+        lines.append("    }")
 
     for i, p in enumerate(fn.params):
         ctype = _C_IN_VAR_MAP[p.type_name]
@@ -119,7 +142,7 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
             "str": "noxpy_py_to_utf8_span_strict",
             "bytes": "noxpy_py_to_bytes_span_strict",
         }[p.type_name]
-        lines.append(f"    if ({conv}(args[{i}], &c_arg_{i}, {_c_escape(p.name)}) < 0) {{")
+        lines.append(f"    if ({conv}(bound[{i}], &c_arg_{i}, {_c_escape(p.name)}) < 0) {{")
         lines.append("        return NULL;")
         lines.append("    }")
 
@@ -213,7 +236,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
     for fn in ir.functions:
         doc_c = _c_escape(fn.doc) if fn.doc else "NULL"
         lines.append(
-            f"    {{ {_c_escape(fn.name)}, _PyCFunction_CAST(noxpy_wrap_{fn.name}), METH_FASTCALL, {doc_c} }},"
+            f"    {{ {_c_escape(fn.name)}, _PyCFunction_CAST(noxpy_wrap_{fn.name}), METH_FASTCALL | METH_KEYWORDS, {doc_c} }},"
         )
     lines.append("    { NULL, NULL, 0, NULL }")
     lines.append("};")

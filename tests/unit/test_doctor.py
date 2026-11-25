@@ -1,4 +1,4 @@
-"""Unit tests for `noxpy.doctor`, `noxpy check`, and fail-closed `noxpy build`."""
+"""Unit tests for `noxpy.doctor`, `noxpy check`, `noxpy new`, and fail-closed `build` when `noxc` missing."""
 
 from __future__ import annotations
 
@@ -30,19 +30,56 @@ class TestDoctorCLI(unittest.TestCase):
         data = json.loads(res.stdout)
         self.assertTrue(data["python"]["meets_315_floor"])
         self.assertTrue(data["python"]["abi3t_header_ready"])
-        self.assertEqual(data["phase_gate"]["current_phase"], 0)
         self.assertIn("phase0_exit_ready", data["phase_gate"])
-        self.assertFalse(data["phase_gate"]["phase1_ready"])
+        self.assertIn("phase1_ready", data["phase_gate"])
+        self.assertEqual(data["phase_gate"]["current_phase"], 1 if data["phase_gate"]["phase1_ready"] else 0)
 
-    def test_build_fails_closed_with_upstream_error(self) -> None:
-        res = subprocess.run(
-            [sys.executable, "-m", "noxpy", "build"],
-            capture_output=True,
-            text=True,
-            env=self._env(),
-        )
-        self.assertNotEqual(res.returncode, 0)
-        self.assertIn("NPY-E-UPSTREAM", res.stderr)
+    def test_build_fails_closed_when_noxc_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            (td_p / "pyproject.toml").write_text(
+                '[project]\nname="demo"\nversion="0.1.0a1"\nrequires-python=">=3.15"\n'
+                '[tool.noxpy]\nmodule-name="demo"\nsource="src/lib.nox"\n',
+                encoding="utf-8",
+            )
+            (td_p / "src").mkdir()
+            (td_p / "src" / "lib.nox").write_text("@export\ndef add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+
+            env = self._env()
+            env["PATH"] = os.defpath
+            env["HOME"] = str(td_p)
+            env.pop("NOXC", None)
+            res = subprocess.run(
+                [sys.executable, "-m", "noxpy", "build", str(td_p)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("NPY-E-UPSTREAM", res.stderr)
+
+    def test_new_command_and_no_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "sample_mod"
+            res = subprocess.run(
+                [sys.executable, "-m", "noxpy", "new", "sample_mod", "--dir", str(proj), "--json"],
+                capture_output=True,
+                text=True,
+                env=self._env(),
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue((proj / "pyproject.toml").is_file())
+            self.assertTrue((proj / "src" / "lib.nox").is_file())
+            self.assertTrue((proj / "tests" / "test_basic.py").is_file())
+
+            res2 = subprocess.run(
+                [sys.executable, "-m", "noxpy", "new", "sample_mod", "--dir", str(proj)],
+                capture_output=True,
+                text=True,
+                env=self._env(),
+            )
+            self.assertNotEqual(res2.returncode, 0)
+            self.assertIn("NPY-E-CONFIG", res2.stderr)
 
     def test_check_command_with_pyproject_and_ir(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -56,7 +93,7 @@ class TestDoctorCLI(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "compiler": {"name": "noxc", "version": "2.2.71", "commit": "abc"},
+                        "compiler": {"name": "noxc", "version": "2.2.81", "commit": "abc"},
                         "module": {"name": "demo._native", "source": "src/lib.nox"},
                         "exports": [],
                     }

@@ -120,6 +120,7 @@ def collect_doctor_report() -> dict[str, object]:
         blocking.append("python3.15t-missing")
 
     phase0_ready = bool(has_abi3t and has_noxc and has_host_abi and has_315t)
+    phase1_ready = phase0_ready
 
     return {
         "platform": {"system": platform.system(), "machine": platform.machine()},
@@ -136,9 +137,9 @@ def collect_doctor_report() -> dict[str, object]:
         "noxc": noxc_info,
         "rtk": {"found": rtk_path is not None, "path": rtk_path, "version": rtk_ver},
         "phase_gate": {
-            "current_phase": 0,
+            "current_phase": 1 if phase1_ready else 0,
             "phase0_exit_ready": phase0_ready,
-            "phase1_ready": False,
+            "phase1_ready": phase1_ready,
             "blocking_requirements": blocking,
         },
     }

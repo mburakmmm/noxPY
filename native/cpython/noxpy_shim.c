@@ -467,3 +467,102 @@ void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status
         ops->error_release(err);
     }
 }
+
+int noxpy_bind_fastcall_kwargs(
+    const char *fn_name,
+    const NoxPyParamSpec *specs,
+    Py_ssize_t nparams,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *kwnames,
+    PyObject **bound_out) {
+    if (!fn_name || (!specs && nparams > 0) || (!bound_out && nparams > 0)) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid argument binder state");
+        return -1;
+    }
+
+    Py_ssize_t max_pos = 0;
+    for (Py_ssize_t i = 0; i < nparams; i++) {
+        bound_out[i] = NULL;
+        if (specs[i].kind != NOXPY_PARAM_KW_ONLY) {
+            max_pos++;
+        }
+    }
+
+    if (nargs > max_pos) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "%s() takes %zd positional argument(s) but %zd were given",
+            fn_name,
+            max_pos,
+            nargs);
+        return -1;
+    }
+
+    for (Py_ssize_t i = 0; i < nargs; i++) {
+        bound_out[i] = args[i];
+    }
+
+    Py_ssize_t nkw = 0;
+    if (kwnames) {
+        nkw = PyTuple_Size(kwnames);
+        if (nkw < 0) {
+            return -1;
+        }
+    }
+
+    for (Py_ssize_t k = 0; k < nkw; k++) {
+        PyObject *kw = PyTuple_GetItem(kwnames, k);
+        if (!kw || !PyUnicode_Check(kw)) {
+            PyErr_SetString(PyExc_TypeError, "keywords must be strings");
+            return -1;
+        }
+        Py_ssize_t match = -1;
+        for (Py_ssize_t i = 0; i < nparams; i++) {
+            int cmp = PyUnicode_CompareWithASCIIString(kw, specs[i].name);
+            if (cmp == 0) {
+                match = i;
+                break;
+            }
+            if (PyErr_Occurred()) {
+                return -1;
+            }
+        }
+        if (match < 0) {
+            Py_ssize_t kw_len = 0;
+            const char *kw_utf8 = PyUnicode_AsUTF8AndSize(kw, &kw_len);
+            if (kw_utf8) {
+                int klen = kw_len > (Py_ssize_t)INT_MAX ? INT_MAX : (int)kw_len;
+                PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument '%.*s'", fn_name, klen, kw_utf8);
+            } else {
+                PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument", fn_name);
+            }
+            return -1;
+        }
+        if (specs[match].kind == NOXPY_PARAM_POS_ONLY) {
+            PyErr_Format(
+                PyExc_TypeError,
+                "%s() got some positional-only arguments passed as keyword arguments: '%s'",
+                fn_name,
+                specs[match].name);
+            return -1;
+        }
+        if (bound_out[match] != NULL) {
+            PyErr_Format(PyExc_TypeError, "%s() got multiple values for argument '%s'", fn_name, specs[match].name);
+            return -1;
+        }
+        bound_out[match] = args[nargs + k];
+    }
+
+    for (Py_ssize_t i = 0; i < nparams; i++) {
+        if (bound_out[i] == NULL) {
+            if (specs[i].kind == NOXPY_PARAM_KW_ONLY) {
+                PyErr_Format(PyExc_TypeError, "%s() missing required keyword-only argument: '%s'", fn_name, specs[i].name);
+            } else {
+                PyErr_Format(PyExc_TypeError, "%s() missing required argument: '%s'", fn_name, specs[i].name);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}

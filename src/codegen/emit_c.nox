@@ -78,6 +78,14 @@ def _in_conv_fn(type_name: str) -> str:
     return "noxpy_py_to_bytes_span_strict"
 
 
+def _param_kind_macro(kind: str) -> str:
+    if kind == "positional_only":
+        return "NOXPY_PARAM_POS_ONLY"
+    if kind == "keyword_only":
+        return "NOXPY_PARAM_KW_ONLY"
+    return "NOXPY_PARAM_POS_OR_KW"
+
+
 def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines: list[str] = []
     c_params: list[str] = ["NoxHostContext *ctx"]
@@ -97,17 +105,37 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
 
     lines.append("extern NoxHostStatus " + fn.c_symbol + "(" + nox.strings.join(c_params, ", ") + ");")
     lines.append("")
-    lines.append("static PyObject *noxpy_wrap_" + fn.name + "(PyObject *module, PyObject *const *args, Py_ssize_t nargs) {")
-    lines.append("    if (nargs != " + str(argc) + ") {")
     lines.append(
-        '        PyErr_Format(PyExc_TypeError, "'
+        "static PyObject *noxpy_wrap_"
         + fn.name
-        + "() takes exactly "
-        + str(argc)
-        + ' argument(s) (%zd given)", nargs);'
+        + "(PyObject *module, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames) {"
     )
-    lines.append("        return NULL;")
-    lines.append("    }")
+    if argc == 0:
+        lines.append("    (void)args;")
+        lines.append("    if (nargs != 0 || (kwnames && PyTuple_Size(kwnames) != 0)) {")
+        lines.append(
+            '        PyErr_Format(PyExc_TypeError, "' + fn.name + '() takes 0 argument(s) (%zd positional given)", nargs);'
+        )
+        lines.append("        return NULL;")
+        lines.append("    }")
+    else:
+        lines.append("    static const NoxPyParamSpec params[] = {")
+        i = 0
+        while i < argc:
+            ps: ParamIR = fn.params[i]
+            lines.append("        { " + c_escape(ps.name) + ", " + _param_kind_macro(ps.kind) + " },")
+            i += 1
+        lines.append("    };")
+        lines.append("    PyObject *bound[" + str(argc) + "] = { NULL };")
+        lines.append(
+            "    if (noxpy_bind_fastcall_kwargs("
+            + c_escape(fn.name)
+            + ", params, "
+            + str(argc)
+            + ", args, nargs, kwnames, bound) < 0) {"
+        )
+        lines.append("        return NULL;")
+        lines.append("    }")
 
     i = 0
     while i < argc:
@@ -116,7 +144,7 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
         init_val: str = "{0}" if ctype == "NoxHostSpan" else "0"
         lines.append("    " + ctype + " c_arg_" + str(i) + " = " + init_val + ";")
         lines.append(
-            "    if (" + _in_conv_fn(p2.type_name) + "(args[" + str(i) + "], &c_arg_" + str(i) + ", " + c_escape(p2.name) + ") < 0) {"
+            "    if (" + _in_conv_fn(p2.type_name) + "(bound[" + str(i) + "], &c_arg_" + str(i) + ", " + c_escape(p2.name) + ") < 0) {"
         )
         lines.append("        return NULL;")
         lines.append("    }")
@@ -217,7 +245,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
     for fn in ir.functions:
         doc_c: str = c_escape(fn.doc) if fn.has_doc and fn.doc != "" else "NULL"
         lines.append(
-            "    { " + c_escape(fn.name) + ", _PyCFunction_CAST(noxpy_wrap_" + fn.name + "), METH_FASTCALL, " + doc_c + " },"
+            "    { " + c_escape(fn.name) + ", _PyCFunction_CAST(noxpy_wrap_" + fn.name + "), METH_FASTCALL | METH_KEYWORDS, " + doc_c + " },"
         )
     lines.append("    { NULL, NULL, 0, NULL }")
     lines.append("};")

@@ -4,9 +4,18 @@ All notable changes to **NoxPy** are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [PEP 440](https://peps.python.org/pep-0440/).
 
-## [Unreleased] — Phase 0 Exit Complete (`noxc v2.2.81` + CPython `3.15.2` / `3.15t`)
+## [Unreleased]
 
-### Changed / Verified
+- Phase 2 (`0.2` Types, Stubs & Packaging) work queued next.
+
+## [0.1.0a1] — 2026-11-25 (Phase 1 Alpha: Functions & Wheels + Phase 0 Exit)
+
+### Added (Phase 1)
+- Positional-only, positional-or-keyword, and keyword-only binding via `noxpy_bind_fastcall_kwargs` (`METH_FASTCALL | METH_KEYWORDS`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) and aligned in [`src/codegen/emit_c.nox`](src/codegen/emit_c.nox) and [`python/noxpy/codegen.py`](python/noxpy/codegen.py).
+- Reusable `abi3t` binary auditor ([`python/noxpy/audit.py`](python/noxpy/audit.py)), PEP 517 dual-tag `cp315-abi3.abi3t` wheel builder ([`python/noxpy/build.py`](python/noxpy/build.py)), and CLI commands `noxpy new`, `noxpy build`, `noxpy develop`, and `noxpy check --inspect`.
+- Runnable Phase 1 example packages [`examples/hello/`](examples/hello/) and [`examples/fastmath/`](examples/fastmath/) plus clean-venv dual-mode tests ([`tests/packaging/test_phase1_wheels.py`](tests/packaging/test_phase1_wheels.py), [`tests/unit/test_packaging_unit.py`](tests/unit/test_packaging_unit.py)), [`ADR-0004`](docs/adr/0004-binding-ir-and-phase1-wheels.md), and [`docs/evidence/phase1-2026-11-25.md`](docs/evidence/phase1-2026-11-25.md).
+
+### Changed / Verified (Phase 0 Exit)
 - Migrated from the temporary `v2.2.70` `--selfhost-obj` bridge to upstream [`native/include/nox_host.h`](native/include/nox_host.h) (`v1`, `--host-abi`, `--emit-obj`, `--emit-shared-lib`), deleting obsolete `nox_v2270_bridge.*` files.
 - Upgraded [`native/include/noxpy_abi.h`](native/include/noxpy_abi.h) and [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) with bounded per-module `NoxHostContext` pooling (`NOXPY_CTX_POOL_CAP = 64`), `NoxPyHostOps`, `NoxHostBuffer` cleanup converters, and `NoxHostError` inspection.
 - Aligned both [`src/codegen/emit_c.nox`](src/codegen/emit_c.nox) and [`python/noxpy/codegen.py`](python/noxpy/codegen.py) to emit `nox_host.h` `v1` wrappers byte-for-byte identically.

@@ -1,0 +1,34 @@
+@export
+def add(a: int, b: int) -> int:
+    """Add two signed 64-bit integers."""
+    return a + b
+
+
+@export
+def greet(name: str) -> str:
+    """Return a UTF-8 greeting preserving embedded NULs."""
+    return "Hello, " + name + "!"
+
+
+@export
+def echo_bytes(raw: bytes) -> bytes:
+    """Round-trip arbitrary bytes across the Nox Host ABI."""
+    return raw
+
+
+@export
+def negate(flag: bool) -> bool:
+    """Invert a strict boolean value."""
+    return not flag
+
+
+@export
+def scale(x: float, factor: float) -> float:
+    """Multiply two IEEE-754 doubles."""
+    return x * factor
+
+
+@export
+def noop() -> None:
+    """Return None."""
+    return

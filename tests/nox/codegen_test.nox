@@ -76,6 +76,8 @@ nox.test.assert_true(nox.strings.contains(c_src, "noxpy_py_to_i64_strict"), "str
 nox.test.assert_true(nox.strings.contains(c_src, "noxpy_bytes_buffer_to_py"), "bytes buffer return converter")
 nox.test.assert_true(nox.strings.contains(c_src, "nox_host_module_init__native"), "host module init hook")
 nox.test.assert_true(nox.strings.contains(c_src, "noxpy_module_ctx_acquire"), "per-thread host context pool")
+nox.test.assert_true(nox.strings.contains(c_src, "METH_FASTCALL | METH_KEYWORDS"), "keyword fastcall flags")
+nox.test.assert_true(nox.strings.contains(c_src, "noxpy_bind_fastcall_kwargs"), "keyword binder call")
 nox.test.assert_true(nox.strings.contains(c_src, "Py_RETURN_NONE;"), "void return")
 
 print("codegen_test passed")

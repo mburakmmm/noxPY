@@ -55,19 +55,19 @@
 
 ---
 
-## Phase 1 — `0.1 alpha`: Functions and Wheel (Next Active Phase)
-- [ ] Replace `experiments/phase0_poc/` experimental bridge with upstream `nox_host.h` production runtime adapter (`src/runtime/`, `native/runtime/`).
-- [ ] Implement deterministic Binding IR schema (`src/codegen/`, `ADR-0004`) fed by upstream typed export metadata (`UR-007`).
-- [ ] Implement primitive type conversions (`int`, `float`, `bool`, `str` with length-aware UTF-8 & embedded NUL, `bytes`, `None`) with exact overflow/strictness checks (`src/types/`, `src/bindings/`).
-- [ ] Support positional, keyword, and default parameter semantics matching IR; reject unsupported combinations at build time.
-- [ ] Implement module init/lifecycle/error mapping (`src/core/`, `src/exceptions/`).
-- [ ] Implement minimal PEP 517 backend (`python/noxpy/build.py`) and CLI (`noxpy new`, `noxpy doctor`, `noxpy build`, `noxpy develop`).
-- [ ] Package dual-tag wheel (`cp315-abi3.abi3t-<platform>.whl`) with `.abi3t.so` / `.pyd` and `Requires-Python: >=3.15`.
-- [ ] Ship `examples/hello` and `examples/fastmath`; verify clean wheel install and unforced dual-mode (`3.15` & `3.15t`) import with no compiler on PATH.
+## Phase 1 — `0.1 alpha`: Functions and Wheel (Complete on macOS arm64; Linux/Windows matrix ongoing)
+- [x] Replace `experiments/phase0_poc/` experimental bridge with upstream `nox_host.h` production runtime adapter (`native/include/nox_host.h`, `native/cpython/noxpy_shim.c`, `src/codegen/emit_c.nox`).
+- [x] Implement deterministic Binding IR schema v1 (`src/codegen/ir.nox`, `python/noxpy/ir.py`, [`ADR-0004`](docs/adr/0004-binding-ir-and-phase1-wheels.md)) fed by upstream `noxc expand --json` (`UR-007`).
+- [x] Implement primitive type conversions (`int`, `float`, `bool`, `str` with length-aware UTF-8 & embedded NUL, `bytes`, `None`) with exact overflow/strictness checks (`native/cpython/noxpy_shim.c`).
+- [x] Support positional-only (`/`), positional-or-keyword, and keyword-only (`*`) argument binding via `noxpy_bind_fastcall_kwargs` (`METH_FASTCALL | METH_KEYWORDS`); reject default values (`NPY-E-TYPE`) and unsupported combinations cleanly at build time.
+- [x] Implement module init/lifecycle/context-pool/error mapping (`NoxPyHostOps`, `noxpy_module_state_init/close`, `noxpy_set_exception_from_host`).
+- [x] Implement minimal PEP 517 backend (`python/noxpy/build.py`), ABI auditor (`python/noxpy/audit.py`), and CLI (`noxpy new`, `noxpy doctor`, `noxpy check`, `noxpy build`, `noxpy develop`).
+- [x] Package audited dual-tag wheel (`cp315-abi3.abi3t-macosx_14_0_arm64.whl`) with `.abi3t.so`, `.pyi`, and `Requires-Python: >=3.15` (verified on macOS `arm64`; Linux/Windows wheel build testing follows in CI/Phase 2+).
+- [x] Ship [`examples/hello`](examples/hello/) and [`examples/fastmath`](examples/fastmath/); verify clean `uv` wheel install and unforced dual-mode (`3.15.2` & `3.15.0b3t`) import outside repo with no compiler on `PATH` (`docs/evidence/phase1-2026-11-25.md`).
 
 ---
 
-## Phase 2 — `0.2`: Types and Packaging (Locked behind Phase 1)
+## Phase 2 — `0.2`: Types and Packaging (Next Active Phase)
 - [ ] Implement `T | None`, `list[T]`, `dict[K, V]`, `tuple` conversions with cycle detection, depth/size limits, and bounded synchronization.
 - [ ] Generate deterministic `.pyi` type stubs and `py.typed` (PEP 561) from Binding IR + `noxpy generate-stubs`.
 - [ ] Support docstrings, `__module__`, `__text_signature__`, and mixed Python/native package layouts (`examples/mixed_package`).

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["noxpy>=0.1.0a1"]
+build-backend = "noxpy.build"
+
+[project]
+name = "noxpy-fastmath"
+version = "0.1.0a1"
+description = "Parallel numeric kernels compiled from Nox via NoxPy."
+requires-python = ">=3.15"
+
+[tool.noxpy]
+module-name = "fastmath"
+source = "src/fastmath.nox"
+backend = "llvm"
+abi = "abi3t"
+free-threaded = true
+generate-stubs = true

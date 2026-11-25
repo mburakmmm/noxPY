@@ -1,5 +1,7 @@
 # Build & temporary artifacts
 build/
+dist/
+*.egg-info/
 experiments/phase0_poc/build/
 *.o
 *.a

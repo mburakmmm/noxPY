@@ -1,0 +1,53 @@
+@export
+def add(a: int, b: int) -> int:
+    """Add two signed 64-bit integers."""
+    return a + b
+
+
+@export
+def fib(n: int) -> int:
+    """Compute the n-th Fibonacci number (raises ValueError for n < 0)."""
+    if n < 0:
+        raise ValueError("negative fibonacci index")
+    if n <= 1:
+        return n
+    a: int = 0
+    b: int = 1
+    i: int = 2
+    while i <= n:
+        nxt: int = a + b
+        a = b
+        b = nxt
+        i = i + 1
+    return b
+
+
+@export
+def work_loop(iters: int, seed: int) -> int:
+    """Run a CPU-bound LCG kernel concurrently across free-threaded workers."""
+    acc: int = seed
+    i: int = 0
+    while i < iters:
+        acc = (acc * 1103515245 + 12345 + i) % 2147483647
+        i = i + 1
+    return acc
+
+
+@export
+def checked_div(a: int, b: int) -> int:
+    """Integer floor division raising ValueError on division by zero."""
+    if b == 0:
+        raise ValueError("division by zero")
+    return a // b
+
+
+@export
+def is_even(n: int) -> bool:
+    """Return True iff n is even."""
+    return (n % 2) == 0
+
+
+@export
+def fma_f64(a: float, b: float, c: float) -> float:
+    """Compute a * b + c in IEEE-754 double precision."""
+    return a * b + c

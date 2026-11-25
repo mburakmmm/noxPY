@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noxpy"
-version = "0.0.0.dev0"
+version = "0.1.0a1"
 description = "Native Python extensions written in Nox. Free-threaded first (abi3t), safe by design."
 readme = "README.md"
 license = "MIT"
@@ -15,7 +15,7 @@ authors = [
 ]
 keywords = ["nox", "python", "cpython", "abi3t", "free-threaded", "native-extension"]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
@@ -39,3 +39,6 @@ noxpy = "noxpy.__main__:main"
 [tool.setuptools.packages.find]
 where = ["python"]
 include = ["noxpy*"]
+
+[tool.setuptools.package-data]
+noxpy = ["_native/include/*.h", "_native/cpython/*.c"]

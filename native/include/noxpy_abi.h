@@ -133,6 +133,29 @@ PyObject *noxpy_bytes_buffer_to_py(const NoxPyHostOps *ops, NoxHostBuffer *buf);
  */
 void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status, NoxHostError *err);
 
+#define NOXPY_PARAM_POS_ONLY 0u
+#define NOXPY_PARAM_POS_OR_KW 1u
+#define NOXPY_PARAM_KW_ONLY 2u
+
+typedef struct NoxPyParamSpec {
+    const char *name;
+    uint8_t kind;
+} NoxPyParamSpec;
+
+/*
+ * Bind METH_FASTCALL | METH_KEYWORDS positional and keyword arguments into `bound_out`.
+ * Enforces positional-only (`/`), positional-or-keyword, and keyword-only (`*`) constraints
+ * with borrowed strong-for-call `PyObject*` references. Returns 0 on success, -1 on TypeError.
+ */
+int noxpy_bind_fastcall_kwargs(
+    const char *fn_name,
+    const NoxPyParamSpec *specs,
+    Py_ssize_t nparams,
+    PyObject *const *args,
+    Py_ssize_t nargs,
+    PyObject *kwnames,
+    PyObject **bound_out);
+
 #ifdef __cplusplus
 }
 #endif

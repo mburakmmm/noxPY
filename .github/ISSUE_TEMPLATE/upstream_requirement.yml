@@ -1,0 +1,43 @@
+name: Upstream Nox Requirement (UR)
+description: Track a compiler or runtime primitive needed in upstream nox-lang
+title: "[UR-XXX]: "
+labels: ["upstream-requirement"]
+body:
+  - type: input
+    id: baseline
+    attributes:
+      label: Observed `noxc` Version & Commit
+      placeholder: "v2.2.70 (4dc061f8)"
+    validations:
+      required: true
+  - type: textarea
+    id: blocker
+    attributes:
+      label: Exact Technical Blocker
+    validations:
+      required: true
+  - type: textarea
+    id: reproducer
+    attributes:
+      label: Minimal Reproducible Example
+      description: Link to `tests/reproducers/...` script and observed output.
+    validations:
+      required: true
+  - type: textarea
+    id: upstream_files
+    attributes:
+      label: Relevant Upstream Source Files
+    validations:
+      required: true
+  - type: textarea
+    id: required_changes
+    attributes:
+      label: Required Compiler / Runtime Changes & Expected ABI Contract
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Measurable Acceptance Tests
+    validations:
+      required: true

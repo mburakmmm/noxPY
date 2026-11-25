@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security Vulnerability (Private Advisory)
+    url: https://github.com/mburakmmm/noxPY/security/advisories/new
+    about: Report memory corruption, data races, or ABI security issues privately.

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "noxpy"
+version = "0.0.0.dev0"
+description = "Native Python extensions written in Nox. Free-threaded first (abi3t), safe by design."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.15"
+authors = [
+  { name = "Melih Burak Memiş" },
+]
+keywords = ["nox", "python", "cpython", "abi3t", "free-threaded", "native-extension"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.15",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/mburakmmm/noxPY"
+Repository = "https://github.com/mburakmmm/noxPY"
+Issues = "https://github.com/mburakmmm/noxPY/issues"
+Changelog = "https://github.com/mburakmmm/noxPY/blob/main/CHANGELOG.md"
+
+[project.scripts]
+noxpy = "noxpy.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["python"]
+include = ["noxpy*"]

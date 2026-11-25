@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene-and-workflows:
+    name: Hygiene, Config & Workflow Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+      - name: Run workflow & release-gate policy tests
+        run: python -m unittest tests/unit/test_workflows.py tests/unit/test_release_gate.py -v
+      - name: Validate JSON hook configs
+        run: |
+          python -c 'import json, pathlib; [json.loads(pathlib.Path(p).read_text()) for p in (".agents/hooks.json", ".agents/plugins/rtk/hooks.json", ".claude/settings.json")]'
+      - name: Verify fail-closed build gate & doctor JSON
+        env:
+          PYTHONPATH: python
+        run: |
+          python -m noxpy doctor --json
+
+  python-unit-and-codegen:
+    name: Unit & Codegen (${{ matrix.os }} / py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        python-version: ["3.15"]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
+      - name: Run unit tests (pure Python + native shim where supported)
+        run: python -m unittest discover -s tests/unit -v
+      - name: Run codegen tests
+        if: runner.os != 'Windows'
+        run: python -m unittest discover -s tests/codegen -v
+
+  native-abi3t-shim-dual-mode:
+    name: Native abi3t Single-Binary Dual-Mode (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: py_gil
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: py_ft
+        with:
+          python-version: "3.15t"
+          allow-prereleases: true
+      - name: Build single abi3t test extension once (-Werror)
+        run: |
+          mkdir -p build_ci
+          PY_INC="$("${{ steps.py_gil.outputs.python-path }}" -c "import sysconfig; print(sysconfig.get_path('include'))")"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            printf "_PyModExport__noxpy_shim_test\n" > build_ci/exports.txt
+            LINK_FLAGS="-bundle -undefined dynamic_lookup -Wl,-exported_symbols_list,build_ci/exports.txt"
+          else
+            printf "{\n  global: PyModExport__noxpy_shim_test;\n  local: *;\n};\n" > build_ci/exports.ver
+            LINK_FLAGS="-shared -Wl,--version-script,build_ci/exports.ver"
+          fi
+          clang -std=c11 -O2 -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+            $LINK_FLAGS \
+            -Inative/include "-I$PY_INC" \
+            -o build_ci/_noxpy_shim_test.abi3t.so \
+            tests/unit/shim_test_ext.c native/cpython/noxpy_shim.c
+          shasum -a 256 build_ci/_noxpy_shim_test.abi3t.so || sha256sum build_ci/_noxpy_shim_test.abi3t.so
+      - name: Audit abi3t symbols and dependencies
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            SYM="_PyModExport__noxpy_shim_test"
+          else
+            SYM="PyModExport__noxpy_shim_test"
+          fi
+          "${{ steps.py_gil.outputs.python-path }}" tests/abi/audit_binary.py build_ci/_noxpy_shim_test.abi3t.so "$SYM"
+      - name: Verify exact same binary on ordinary CPython 3.15
+        env:
+          PYTHONPATH: build_ci
+        run: |
+          "${{ steps.py_gil.outputs.python-path }}" -c 'import sys, _noxpy_shim_test as m; assert sys._is_gil_enabled(); assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"'
+      - name: Verify exact same binary on unforced free-threaded CPython 3.15t
+        env:
+          PYTHONPATH: build_ci
+        run: |
+          "${{ steps.py_ft.outputs.python-path }}" -c 'import sys, _noxpy_shim_test as m; assert not sys._is_gil_enabled(), "did not start free-threaded"; assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"; assert not sys._is_gil_enabled(), "extension re-enabled GIL!"'
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: abi3t-shim-${{ runner.os }}
+          path: build_ci/_noxpy_shim_test.abi3t.so
+
+  ci-summary:
+    name: CI Gate Summary
+    needs: [hygiene-and-workflows, python-unit-and-codegen, native-abi3t-shim-dual-mode]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report CI pass
+        run: echo "All required NoxPy CI gates passed."

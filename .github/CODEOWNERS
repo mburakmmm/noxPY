@@ -1,0 +1,8 @@
+# Default owner
+* @mburakmmm
+
+# Security- and ABI-critical boundaries
+/native/ @mburakmmm
+/.github/workflows/ @mburakmmm
+/scripts/release/ @mburakmmm
+/UPSTREAM_REQUIREMENTS.md @mburakmmm

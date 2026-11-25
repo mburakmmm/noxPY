@@ -1,0 +1,52 @@
+class PocValueError(Exception):
+    def __init__(self, msg: str) -> None:
+        self.message = msg
+
+
+def nox_add(a: int, b: int) -> int:
+    return a + b
+
+
+def nox_fib(n: int) -> int:
+    if n < 0:
+        raise PocValueError("negative fibonacci index")
+    if n <= 1:
+        return n
+    a: int = 0
+    b: int = 1
+    i: int = 2
+    while i <= n:
+        nxt: int = a + b
+        a = b
+        b = nxt
+        i = i + 1
+    return b
+
+
+def nox_work_loop(iters: int, seed: int) -> int:
+    acc: int = seed
+    i: int = 0
+    while i < iters:
+        acc = (acc * 1103515245 + 12345 + i) % 2147483647
+        i = i + 1
+    return acc
+
+
+def nox_checked_div(a: int, b: int) -> int:
+    if b == 0:
+        raise PocValueError("division by zero")
+    return a // b
+
+
+def nox_alloc_checksum(n: int) -> int:
+    if n < 0:
+        raise PocValueError("negative length")
+    xs: list[int] = []
+    i: int = 0
+    while i < n:
+        xs.append(i)
+        i = i + 1
+    total: int = 0
+    for x in xs:
+        total = total + x
+    return total

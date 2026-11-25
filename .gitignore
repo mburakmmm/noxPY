@@ -1,0 +1,33 @@
+# Build & temporary artifacts
+build/
+experiments/phase0_poc/build/
+*.o
+*.a
+*.ll
+*.ssa
+*.s
+*.so
+*.dylib
+*.dll
+*.pyd
+*.whl
+*.tar.gz
+*.dSYM/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# OS / Editor
+.DS_Store
+*.swp
+*.swo
+
+# Hook audit logs
+.agents/rtk-audit/
+.claude/token-audit/

@@ -1,0 +1,26 @@
+name: Bug Report
+description: Report a bug in NoxPy native shims, IR/codegen, packaging, or ABI checks
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Description
+      description: Clear summary of the unexpected behavior or failure.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Output of `python -m noxpy doctor --json` and `noxc --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal Reproducer
+      description: Exact commands, `.nox`/`.py` snippet, and observed stdout/stderr/exit code.
+    validations:
+      required: true

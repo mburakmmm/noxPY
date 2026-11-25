@@ -31,6 +31,7 @@ class TestDoctorCLI(unittest.TestCase):
         self.assertTrue(data["python"]["meets_315_floor"])
         self.assertTrue(data["python"]["abi3t_header_ready"])
         self.assertEqual(data["phase_gate"]["current_phase"], 0)
+        self.assertIn("phase0_exit_ready", data["phase_gate"])
         self.assertFalse(data["phase_gate"]["phase1_ready"])
 
     def test_build_fails_closed_with_upstream_error(self) -> None:

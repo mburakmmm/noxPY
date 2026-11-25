@@ -1,0 +1,99 @@
+# Genuine Nox unit tests for src.builder.config (noxc test tests/nox).
+
+import nox.test
+from src.builder.config import NoxPyProjectConfig, parse_pyproject_toml
+from src.core.errors import NoxPyError
+
+VALID_TOML: str = """[project]
+name = "fastmath"
+version = "0.1.0"
+requires-python = ">=3.15"
+
+[tool.noxpy]
+module-name = "pkg.fastmath._core"
+source = "src/lib.nox"
+backend = "llvm"
+abi = "abi3t"
+free-threaded = true
+generate-stubs = true
+python-source = "python"
+"""
+
+cfg: NoxPyProjectConfig = parse_pyproject_toml(VALID_TOML, "pyproject.toml")
+nox.test.assert_eq_str(cfg.distribution_name, "fastmath", "dist name")
+nox.test.assert_eq_str(cfg.module_name, "pkg.fastmath._core", "module name")
+nox.test.assert_eq_str(cfg.leaf_name, "_core", "leaf name")
+nox.test.assert_eq_str(cfg.backend, "llvm", "backend")
+nox.test.assert_eq_str(cfg.abi, "abi3t", "abi")
+nox.test.assert_true(cfg.free_threaded, "free_threaded")
+nox.test.assert_true(cfg.generate_stubs, "generate_stubs")
+nox.test.assert_eq_str(cfg.python_source_rel, "python", "python_source_rel")
+
+
+def _expect_cfg_err(toml_text: str, expected_code: str, label: str) -> None:
+    caught: bool = False
+    try:
+        parse_pyproject_toml(toml_text, "pyproject.toml")
+    except NoxPyError as e:
+        caught = True
+        nox.test.assert_eq_str(e.code, expected_code, label + " error code")
+    nox.test.assert_true(caught, label + " should fail")
+
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.14"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\n',
+    "NPY-E-ABI",
+    "requires-python 3.14 rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">3.13"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\n',
+    "NPY-E-ABI",
+    "requires-python >3.13 rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\nbackend = "qbe"\n',
+    "NPY-E-CONFIG",
+    "qbe backend rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\nabi = "cp315"\n',
+    "NPY-E-ABI",
+    "non-abi3t rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\nfree-threaded = false\n',
+    "NPY-E-ABI",
+    "free-threaded false rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "../escape.nox"\n',
+    "NPY-E-CONFIG",
+    "path traversal rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "/abs/path.nox"\n',
+    "NPY-E-CONFIG",
+    "absolute source path rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "a"\nsource = "a.nox"\nunknown_key = true\n',
+    "NPY-E-CONFIG",
+    "unknown tool key rejected",
+)
+
+_expect_cfg_err(
+    '[project]\nname = "a"\nversion = "0.1.0"\nrequires-python = ">=3.15"\n\n[tool.noxpy]\nmodule-name = "pkg.1bad"\nsource = "a.nox"\n',
+    "NPY-E-CONFIG",
+    "invalid module ident rejected",
+)
+
+_expect_cfg_err("not valid toml = = =", "NPY-E-CONFIG", "malformed toml rejected")
+
+print("config_test passed")

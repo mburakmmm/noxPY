@@ -4,9 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export NOXC="${NOXC:-$(command -v noxc)}"
 export NOXRT="${NOXRT:-$(cd "$(dirname "$NOXC")/.." && pwd)/lib/noxrt.o}"
+export NOX_INCLUDE="${NOX_INCLUDE:-$(cd "$(dirname "$NOXC")/.." && pwd)/include}"
 
 NOXC_VER="$("$NOXC" --version 2>&1 | tr -d '\n')"
-echo "=== Running NoxPy Upstream Blocker Reproducers ==="
+
+if [ -f "$NOX_INCLUDE/nox_host.h" ]; then
+    bash "$SCRIPT_DIR/verify_v2281_contracts.sh"
+    exit 0
+fi
+
+echo "=== Running Legacy Pre-v2.2.78 Upstream Blocker Reproducers ==="
 echo "NOXC=$NOXC ($NOXC_VER)"
 echo "NOXRT=$NOXRT"
 echo

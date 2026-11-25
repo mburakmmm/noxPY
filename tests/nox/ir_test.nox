@@ -1,0 +1,159 @@
+# Genuine Nox unit tests for src.codegen.ir (noxc test tests/nox).
+
+import nox.test
+from src.codegen.ir import ModuleIR, parse_upstream_metadata_json
+from src.core.errors import NoxPyError
+
+VALID_OUT_OF_ORDER: str = """{
+  "schema_version": 1,
+  "compiler": {"name": "noxc", "version": "2.2.70", "commit": "4dc061f8"},
+  "module": {"name": "pkg._math", "source": "src/math.nox"},
+  "exports": [
+    {
+      "kind": "function",
+      "id": "pkg::z_last",
+      "name": "z_last",
+      "c_symbol": "nox_host_z_last",
+      "doc": null,
+      "thread_policy": "parallel",
+      "span": {"file": "src/math.nox", "line": 20, "column": 1},
+      "params": [],
+      "return_type": "None"
+    },
+    {
+      "kind": "function",
+      "id": "pkg::a_first",
+      "name": "a_first",
+      "c_symbol": "nox_host_a_first",
+      "doc": "First sorted export.",
+      "thread_policy": "parallel",
+      "span": {"file": "src/math.nox", "line": 5, "column": 1},
+      "params": [
+        {"name": "x", "type": "int", "kind": "positional_only", "has_default": false},
+        {"name": "y", "type": "float", "kind": "keyword_only", "has_default": false}
+      ],
+      "return_type": "int"
+    }
+  ]
+}"""
+
+ir: ModuleIR = parse_upstream_metadata_json(VALID_OUT_OF_ORDER, "pkg._math", "abi3t", True)
+nox.test.assert_eq_int(ir.schema_version, 1, "schema_version")
+nox.test.assert_eq_str(ir.leaf_name, "_math", "leaf_name")
+nox.test.assert_eq_int(len(ir.functions), 2, "export count")
+nox.test.assert_eq_str(ir.functions[0].name, "a_first", "deterministic sort first")
+nox.test.assert_eq_str(ir.functions[1].name, "z_last", "deterministic sort second")
+nox.test.assert_true(ir.functions[0].has_doc, "a_first has doc")
+nox.test.assert_false(ir.functions[1].has_doc, "z_last doc is null")
+
+
+def _expect_err(raw: str, expected_mod: str, expected_code: str, label: str) -> None:
+    caught: bool = False
+    try:
+        parse_upstream_metadata_json(raw, expected_mod, "abi3t", True)
+    except NoxPyError as e:
+        caught = True
+        nox.test.assert_eq_str(e.code, expected_code, label + " error code")
+    nox.test.assert_true(caught, label + " should fail")
+
+
+_expect_err("{not json", "", "NPY-E-CODEGEN", "malformed json")
+
+_expect_err(
+    '{"schema_version": 99, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": []}',
+    "",
+    "NPY-E-CODEGEN",
+    "bad schema version",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "gcc", "version": "1.0"}, "module": {"name": "m", "source": "m.nox"}, "exports": []}',
+    "",
+    "NPY-E-CODEGEN",
+    "bad compiler",
+)
+
+_expect_err(
+    VALID_OUT_OF_ORDER,
+    "pkg.other",
+    "NPY-E-CONFIG",
+    "module name mismatch",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "dup", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"},'
+    '{"kind": "function", "id": "id2", "name": "dup", "c_symbol": "s2", "span": {"file": "m.nox", "line": 2}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "duplicate fn name",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "same_id", "name": "f1", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"},'
+    '{"kind": "function", "id": "same_id", "name": "f2", "c_symbol": "s2", "span": {"file": "m.nox", "line": 2}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-CODEGEN",
+    "duplicate export id",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "return", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "c keyword",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "__init__", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "reserved dunder",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "PyModExport_foo", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "reserved PyModExport prefix",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [{"name": "xs", "type": "list[int]"}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "unsupported param type",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "thread_policy": "unsafe", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "invalid thread policy",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": ['
+    '{"name": "k", "type": "int", "kind": "keyword_only"}, {"name": "p", "type": "int", "kind": "positional_only"}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "invalid param order",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": ['
+    '{"name": "p", "type": "int", "has_default": true}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "unsupported default value",
+)
+
+print("ir_test passed")

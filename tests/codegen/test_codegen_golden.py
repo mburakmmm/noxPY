@@ -79,6 +79,8 @@ class TestCodegenGolden(unittest.TestCase):
         c_src = generate_c_adapter(ir)
         self.assertIn("PyModExport__native(void)", c_src)
         self.assertIn("PySlot_STATIC_DATA(Py_mod_methods, noxpy_methods__native)", c_src)
+        self.assertIn("noxpy_bytes_buffer_to_py(st->host_ops, &c_ret)", c_src)
+        self.assertIn("nox_host_module_init__native", c_src)
         self.assertIn('Add \\"two\\" ints.\\nLine 2.', c_src)
 
         py_inc = sysconfig.get_path("include")

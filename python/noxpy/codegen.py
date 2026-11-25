@@ -67,12 +67,20 @@ def generate_pyi(ir: ModuleIR) -> str:
     return "\n".join(lines)
 
 
-_C_HOST_TYPE_MAP = {
+_C_IN_VAR_MAP = {
     "int": "int64_t",
     "float": "double",
     "bool": "uint8_t",
     "str": "NoxHostSpan",
     "bytes": "NoxHostSpan",
+}
+
+_C_RET_VAR_MAP = {
+    "int": "int64_t",
+    "float": "double",
+    "bool": "uint8_t",
+    "str": "NoxHostBuffer",
+    "bytes": "NoxHostBuffer",
     "None": "void",
 }
 
@@ -81,10 +89,14 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines: list[str] = []
     c_params = ["NoxHostContext *ctx"]
     for i, p in enumerate(fn.params):
-        c_params.append(f"{_C_HOST_TYPE_MAP[p.type_name]} arg_{i}")
+        if p.type_name in ("str", "bytes"):
+            c_params.append(f"const uint8_t *arg_{i}_data")
+            c_params.append(f"size_t arg_{i}_len")
+        else:
+            c_params.append(f"{_C_IN_VAR_MAP[p.type_name]} arg_{i}")
     if fn.return_type != "None":
-        c_params.append(f"{_C_HOST_TYPE_MAP[fn.return_type]} *out_val")
-    c_params.append("NoxHostError *out_err")
+        c_params.append(f"{_C_RET_VAR_MAP[fn.return_type]} *out_val")
+    c_params.append("NoxHostError **out_err")
 
     lines.append(f"extern NoxHostStatus {fn.c_symbol}({', '.join(c_params)});")
     lines.append("")
@@ -97,7 +109,7 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines.append("    }")
 
     for i, p in enumerate(fn.params):
-        ctype = _C_HOST_TYPE_MAP[p.type_name]
+        ctype = _C_IN_VAR_MAP[p.type_name]
         init = "{0}" if ctype == "NoxHostSpan" else "0"
         lines.append(f"    {ctype} c_arg_{i} = {init};")
         conv = {
@@ -115,55 +127,82 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines.append("    if (!st || noxpy_module_lease_acquire(st) < 0) {")
     lines.append("        return NULL;")
     lines.append("    }")
+    lines.append("    NoxHostContext *ctx = NULL;")
+    lines.append("    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {")
+    lines.append("        noxpy_module_lease_release(st);")
+    lines.append("        return NULL;")
+    lines.append("    }")
 
     if fn.return_type != "None":
-        ret_ctype = _C_HOST_TYPE_MAP[fn.return_type]
-        ret_init = "{0}" if ret_ctype == "NoxHostSpan" else "0"
+        ret_ctype = _C_RET_VAR_MAP[fn.return_type]
+        ret_init = "{0}" if ret_ctype == "NoxHostBuffer" else "0"
         lines.append(f"    {ret_ctype} c_ret = {ret_init};")
 
-    call_args = ["st->host_ctx"] + [f"c_arg_{i}" for i in range(len(fn.params))]
+    call_args = ["ctx"]
+    for i, p in enumerate(fn.params):
+        if p.type_name in ("str", "bytes"):
+            call_args.append(f"c_arg_{i}.data")
+            call_args.append(f"c_arg_{i}.len")
+        else:
+            call_args.append(f"c_arg_{i}")
     if fn.return_type != "None":
         call_args.append("&c_ret")
     call_args.append("&err")
 
-    lines.append("    NoxHostError err = {0};")
+    lines.append("    NoxHostError *err = NULL;")
     lines.append("    NoxHostStatus rc;")
     lines.append("    Py_BEGIN_ALLOW_THREADS")
     lines.append(f"    rc = {fn.c_symbol}({', '.join(call_args)});")
     lines.append("    Py_END_ALLOW_THREADS")
-    lines.append("    noxpy_module_lease_release(st);")
     lines.append("    if (rc != NOX_HOST_OK) {")
-    lines.append("        noxpy_set_exception_from_host(rc, &err);")
-    lines.append("        if (st->runtime_ops && st->runtime_ops->error_clear) {")
-    lines.append("            st->runtime_ops->error_clear(&err);")
-    lines.append("        }")
+    lines.append("        noxpy_set_exception_from_host(st->host_ops, rc, err);")
+    lines.append("        noxpy_module_ctx_release(st, ctx);")
+    lines.append("        noxpy_module_lease_release(st);")
     lines.append("        return NULL;")
     lines.append("    }")
+    lines.append("    noxpy_module_ctx_release(st, ctx);")
+    lines.append("    noxpy_module_lease_release(st);")
 
     if fn.return_type == "None":
         lines.append("    Py_RETURN_NONE;")
+    elif fn.return_type == "int":
+        lines.append("    return noxpy_i64_to_py(c_ret);")
+    elif fn.return_type == "float":
+        lines.append("    return noxpy_f64_to_py(c_ret);")
+    elif fn.return_type == "bool":
+        lines.append("    return noxpy_bool_to_py(c_ret);")
+    elif fn.return_type == "str":
+        lines.append("    return noxpy_utf8_buffer_to_py(st->host_ops, &c_ret);")
     else:
-        ret_conv = {
-            "int": "noxpy_i64_to_py",
-            "float": "noxpy_f64_to_py",
-            "bool": "noxpy_bool_to_py",
-            "str": "noxpy_utf8_span_to_py",
-            "bytes": "noxpy_bytes_span_to_py",
-        }[fn.return_type]
-        lines.append(f"    return {ret_conv}(c_ret);")
+        lines.append("    return noxpy_bytes_buffer_to_py(st->host_ops, &c_ret);")
     lines.append("}")
     lines.append("")
     return lines
 
 
 def generate_c_adapter(ir: ModuleIR) -> str:
-    """Emit deterministic CPython 3.15 `abi3t` C adapter targeting `nox_host_abi.h`."""
+    """Emit deterministic CPython 3.15 `abi3t` C adapter targeting `nox_host.h`."""
     leaf = ir.leaf_name
     lines: list[str] = [
         f"/* Generated by noxpy from {ir.source} (noxc {ir.compiler_version}). Do not hand-edit. */",
         '#include "noxpy_abi.h"',
         "",
-        "extern const NoxHostRuntimeOps *nox_host_runtime_ops_v1(void);",
+        f"extern NoxHostStatus nox_host_module_init_{leaf}(NoxHostContext *ctx, NoxHostError **err);",
+        f"extern void nox_host_module_fini_{leaf}(NoxHostContext *ctx);",
+        "",
+        f"static const NoxPyHostOps noxpy_host_ops_{leaf} = {{",
+        "    .struct_size = (uint32_t)sizeof(NoxPyHostOps),",
+        "    .abi_version = NOX_HOST_ABI_VERSION,",
+        "    .context_create = nox_host_context_create,",
+        "    .context_destroy = nox_host_context_destroy,",
+        f"    .module_init = nox_host_module_init_{leaf},",
+        f"    .module_fini = nox_host_module_fini_{leaf},",
+        "    .buffer_release = nox_host_buffer_release,",
+        "    .error_release = nox_host_error_release,",
+        "    .error_line = nox_host_error_line,",
+        "    .error_class_name = nox_host_error_class_name,",
+        "    .error_message = nox_host_error_message,",
+        "};",
         "",
     ]
 
@@ -187,7 +226,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
             '        PyErr_SetString(PyExc_RuntimeError, "noxpy: missing module state");',
             "        return -1;",
             "    }",
-            "    return noxpy_module_state_init(st, nox_host_runtime_ops_v1());",
+            f"    return noxpy_module_state_init(st, &noxpy_host_ops_{leaf});",
             "}",
             "",
             f"static void noxpy_free_{leaf}(void *module) {{",

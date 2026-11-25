@@ -1,15 +1,19 @@
-class PocValueError(Exception):
-    def __init__(self, msg: str) -> None:
-        self.message = msg
+class Counter:
+    value: int
+
+    def __init__(self, start: int) -> None:
+        self.value = start
 
 
-def nox_add(a: int, b: int) -> int:
+@export
+def add(a: int, b: int) -> int:
     return a + b
 
 
-def nox_fib(n: int) -> int:
+@export
+def fib(n: int) -> int:
     if n < 0:
-        raise PocValueError("negative fibonacci index")
+        raise ValueError("negative fibonacci index")
     if n <= 1:
         return n
     a: int = 0
@@ -23,7 +27,8 @@ def nox_fib(n: int) -> int:
     return b
 
 
-def nox_work_loop(iters: int, seed: int) -> int:
+@export
+def work_loop(iters: int, seed: int) -> int:
     acc: int = seed
     i: int = 0
     while i < iters:
@@ -32,15 +37,17 @@ def nox_work_loop(iters: int, seed: int) -> int:
     return acc
 
 
-def nox_checked_div(a: int, b: int) -> int:
+@export
+def checked_div(a: int, b: int) -> int:
     if b == 0:
-        raise PocValueError("division by zero")
+        raise ValueError("division by zero")
     return a // b
 
 
-def nox_alloc_checksum(n: int) -> int:
+@export
+def alloc_checksum(n: int) -> int:
     if n < 0:
-        raise PocValueError("negative length")
+        raise ValueError("negative length")
     xs: list[int] = []
     i: int = 0
     while i < n:
@@ -50,3 +57,24 @@ def nox_alloc_checksum(n: int) -> int:
     for x in xs:
         total = total + x
     return total
+
+
+@export
+def echo_str(s: str) -> str:
+    return s
+
+
+@export
+def echo_bytes(raw: bytes) -> bytes:
+    return raw
+
+
+@export
+def counter_new(start: int) -> Counter:
+    return Counter(start)
+
+
+@export
+def counter_inc(c: Counter, delta: int) -> int:
+    c.value = c.value + delta
+    return c.value

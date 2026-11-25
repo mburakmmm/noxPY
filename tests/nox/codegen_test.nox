@@ -1,0 +1,81 @@
+# Genuine Nox unit tests for src.codegen.emit_pyi and emit_c (noxc test tests/nox).
+
+import nox.strings
+import nox.test
+from src.codegen.emit_c import c_escape, generate_c_adapter
+from src.codegen.emit_pyi import generate_pyi
+from src.codegen.ir import ModuleIR, parse_upstream_metadata_json
+
+MANIFEST_JSON: str = """{
+  "schema_version": 1,
+  "compiler": {"name": "noxc", "version": "2.2.71", "commit": "abc123"},
+  "module": {"name": "pkg._native", "source": "src/lib.nox"},
+  "exports": [
+    {
+      "kind": "function",
+      "id": "pkg::add",
+      "name": "add",
+      "c_symbol": "nox_host_export_pkg_add",
+      "doc": "Add \\"two\\" ints.\\nLine 2.",
+      "thread_policy": "parallel",
+      "span": {"file": "src/lib.nox", "line": 3, "column": 1},
+      "params": [
+        {"name": "a", "type": "int", "kind": "positional_only", "has_default": false},
+        {"name": "b", "type": "int", "kind": "positional_or_keyword", "has_default": false}
+      ],
+      "return_type": "int"
+    },
+    {
+      "kind": "function",
+      "id": "pkg::echo_bytes",
+      "name": "echo_bytes",
+      "c_symbol": "nox_host_export_pkg_echo_bytes",
+      "doc": null,
+      "thread_policy": "parallel",
+      "span": {"file": "src/lib.nox", "line": 7, "column": 1},
+      "params": [{"name": "payload", "type": "bytes", "kind": "keyword_only", "has_default": false}],
+      "return_type": "bytes"
+    },
+    {
+      "kind": "function",
+      "id": "pkg::greet",
+      "name": "greet",
+      "c_symbol": "nox_host_export_pkg_greet",
+      "doc": null,
+      "thread_policy": "parallel",
+      "span": {"file": "src/lib.nox", "line": 11, "column": 1},
+      "params": [
+        {"name": "name", "type": "str"},
+        {"name": "flag", "type": "bool"},
+        {"name": "scale", "type": "float"}
+      ],
+      "return_type": "None"
+    }
+  ]
+}"""
+
+ir: ModuleIR = parse_upstream_metadata_json(MANIFEST_JSON, "", "abi3t", True)
+
+pyi_1: str = generate_pyi(ir)
+pyi_2: str = generate_pyi(ir)
+nox.test.assert_eq_str(pyi_1, pyi_2, "pyi determinism")
+nox.test.assert_true(nox.strings.contains(pyi_1, "def add(a: int, /, b: int) -> int:"), "pos_only signature")
+nox.test.assert_true(nox.strings.contains(pyi_1, "def echo_bytes(*, payload: bytes) -> bytes: ..."), "kw_only signature")
+nox.test.assert_true(nox.strings.contains(pyi_1, "def greet(name: str, flag: bool, scale: float) -> None: ..."), "none return")
+
+nox.test.assert_eq_str(c_escape('a\\"b\n\t'), '"a\\\\\\"b\\n\\t"', "c_escape specials")
+nox.test.assert_eq_str(c_escape(nox.strings.char_from_byte(7) + nox.strings.char_from_byte(127)), '"\\x07\\x7f"', "c_escape control bytes")
+nox.test.assert_eq_str(c_escape("hé"), '"hé"', "c_escape utf8")
+
+c_src: str = generate_c_adapter(ir)
+nox.test.assert_true(nox.strings.contains(c_src, "PyModExport__native(void)"), "PyModExport_<leaf>")
+nox.test.assert_true(nox.strings.contains(c_src, "PySlot_STATIC_DATA(Py_mod_methods, noxpy_methods__native)"), "PySlot_STATIC_DATA")
+nox.test.assert_true(nox.strings.contains(c_src, "Py_MOD_GIL_NOT_USED"), "free-threaded gil slot")
+nox.test.assert_true(nox.strings.contains(c_src, "Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED"), "subinterpreter guard")
+nox.test.assert_true(nox.strings.contains(c_src, "noxpy_py_to_i64_strict"), "strict int64 converter")
+nox.test.assert_true(nox.strings.contains(c_src, "noxpy_bytes_buffer_to_py"), "bytes buffer return converter")
+nox.test.assert_true(nox.strings.contains(c_src, "nox_host_module_init__native"), "host module init hook")
+nox.test.assert_true(nox.strings.contains(c_src, "noxpy_module_ctx_acquire"), "per-thread host context pool")
+nox.test.assert_true(nox.strings.contains(c_src, "Py_RETURN_NONE;"), "void return")
+
+print("codegen_test passed")

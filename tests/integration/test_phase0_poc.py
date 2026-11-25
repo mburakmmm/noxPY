@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Integration, strict conversion, exception containment, concurrency, and teardown tests for Phase 0 PoC."""
+"""Integration, strict conversion, exception containment, spans, concurrency, and teardown tests for Phase 0."""
 
 from __future__ import annotations
 
@@ -36,9 +36,15 @@ def test_basic_and_multi_module() -> None:
     assert _noxpy_poc.alloc_checksum(1000) == 499500
     assert _noxpy_poc.checked_div(42, 6) == 7
 
+    s = "hello\x00ğüşiöç🚀world"
+    assert _noxpy_poc.echo_str(s) == s
+    assert len(_noxpy_poc.echo_str("a\x00b")) == 3
+    raw = b"\x00\x01\xffnox\x00end"
+    assert _noxpy_poc.echo_bytes(raw) == raw
+
     assert _noxpy_poc_b.mul(6, 7) == 42
     assert _noxpy_poc_b.sub(100, 58) == 42
-    print("[PASS] basic arithmetic, int64 boundaries, fib, alloc_checksum, dual-module")
+    print("[PASS] basic arithmetic, int64 boundaries, fib, alloc_checksum, binary-safe str/bytes, dual-module")
 
 
 def test_strict_conversions() -> None:
@@ -54,18 +60,21 @@ def test_strict_conversions() -> None:
     assert_raises(TypeError, _noxpy_poc.add, 1, 2, 3)
     assert_raises(OverflowError, _noxpy_poc.add, 1 << 63, 1)
     assert_raises(OverflowError, _noxpy_poc.add, -(1 << 63) - 1, 0)
-    print("[PASS] strict int/bool/no-__index__/overflow/arity rejections")
+    assert_raises(TypeError, _noxpy_poc.echo_str, b"bytes")
+    assert_raises(UnicodeEncodeError, _noxpy_poc.echo_str, "\ud800")
+    assert_raises(TypeError, _noxpy_poc.echo_bytes, "str")
+    print("[PASS] strict int/bool/str/bytes/no-__index__/overflow/arity rejections")
 
 
 def test_exception_containment() -> None:
     import _noxpy_poc
 
-    exc = assert_raises(RuntimeError, _noxpy_poc.checked_div, 42, 0)
-    assert "NoxException" in str(exc)
-    exc2 = assert_raises(RuntimeError, _noxpy_poc.fib, -1)
-    assert "NoxException" in str(exc2)
+    exc = assert_raises(ValueError, _noxpy_poc.checked_div, 42, 0)
+    assert "ValueError" in str(exc) and "division by zero" in str(exc), str(exc)
+    exc2 = assert_raises(ValueError, _noxpy_poc.fib, -1)
+    assert "ValueError" in str(exc2) and "negative fibonacci index" in str(exc2), str(exc2)
     assert _noxpy_poc.add(20, 22) == 42
-    print("[PASS] Nox exception containment without process abort or pending error leak")
+    print("[PASS] Nox ValueError inspection & containment without process abort or leak")
 
 
 def test_concurrency() -> None:
@@ -86,12 +95,14 @@ def test_concurrency() -> None:
                     w = _noxpy_poc.work_loop(250_000, tid + i)
                     assert isinstance(w, int)
                     assert _noxpy_poc.alloc_checksum(200) == 19900
+                    assert _noxpy_poc.echo_str(f"t{tid}\x00{i}") == f"t{tid}\x00{i}"
+                    assert _noxpy_poc.echo_bytes(bytes([0, tid, i & 0xFF])) == bytes([0, tid, i & 0xFF])
                     assert _noxpy_poc_b.mul(tid + 2, 7) == (tid + 2) * 7
                     assert _noxpy_poc_b.sub(100, tid) == 100 - tid
                     try:
                         _noxpy_poc.checked_div(10, 0)
-                        raise AssertionError("expected RuntimeError")
-                    except RuntimeError:
+                        raise AssertionError("expected ValueError")
+                    except ValueError:
                         pass
             except BaseException as exc:  # noqa: BLE001
                 with lock:
@@ -120,6 +131,7 @@ def w(i):
     try:
         b.wait(5)
         assert _noxpy_poc.add(20, 22) == 42
+        assert _noxpy_poc.echo_str("hi\\x00nox") == "hi\\x00nox"
         assert _noxpy_poc.alloc_checksum(100) == 4950
         assert _noxpy_poc_b.mul(6, 7) == 42
     except BaseException as e:

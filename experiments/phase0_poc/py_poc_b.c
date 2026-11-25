@@ -1,12 +1,30 @@
-#ifndef NOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE
-#  error "py_poc_b.c requires NOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE"
-#endif
-
 #include "noxpy_abi.h"
-#include "nox_v2270_bridge.h"
 
-extern int64_t nox_mul(void *rt, int64_t a, int64_t b);
-extern int64_t nox_sub(void *rt, int64_t a, int64_t b);
+/*
+ * Second independent NoxPy Phase 0 CPython 3.15 abi3t extension via upstream `nox_host.h` v1.
+ */
+
+extern NoxHostStatus nox_host_module_init__noxpy_poc_b(NoxHostContext *ctx, NoxHostError **err);
+extern void nox_host_module_fini__noxpy_poc_b(NoxHostContext *ctx);
+
+extern NoxHostStatus nox_host_export__noxpy_poc_b_mul(
+    NoxHostContext *ctx, int64_t a, int64_t b, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_b_sub(
+    NoxHostContext *ctx, int64_t a, int64_t b, int64_t *out, NoxHostError **err);
+
+static const NoxPyHostOps g_poc_b_ops = {
+    .struct_size = (uint32_t)sizeof(NoxPyHostOps),
+    .abi_version = NOX_HOST_ABI_VERSION,
+    .context_create = nox_host_context_create,
+    .context_destroy = nox_host_context_destroy,
+    .module_init = nox_host_module_init__noxpy_poc_b,
+    .module_fini = nox_host_module_fini__noxpy_poc_b,
+    .buffer_release = nox_host_buffer_release,
+    .error_release = nox_host_error_release,
+    .error_line = nox_host_error_line,
+    .error_class_name = nox_host_error_class_name,
+    .error_message = nox_host_error_message,
+};
 
 static NoxPyModuleState *get_mod_state(PyObject *module) {
     NoxPyModuleState *st = (NoxPyModuleState *)PyModule_GetState(module);
@@ -31,19 +49,27 @@ static PyObject *py_nox_mul(PyObject *module, PyObject *const *args, Py_ssize_t 
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
-
-    int64_t result = 0;
-    NoxHostError err = {0};
-    NoxHostStatus rc;
-    Py_BEGIN_ALLOW_THREADS
-    rc = nox_v2270_call_2_i64(nox_mul, a, b, &result, &err);
-    Py_END_ALLOW_THREADS
-
-    noxpy_module_lease_release(st);
-    if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
         return NULL;
     }
+
+    int64_t result = 0;
+    NoxHostError *err = NULL;
+    NoxHostStatus rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = nox_host_export__noxpy_poc_b_mul(ctx, a, b, &result, &err);
+    Py_END_ALLOW_THREADS
+
+    if (rc != NOX_HOST_OK) {
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -61,19 +87,27 @@ static PyObject *py_nox_sub(PyObject *module, PyObject *const *args, Py_ssize_t 
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
-
-    int64_t result = 0;
-    NoxHostError err = {0};
-    NoxHostStatus rc;
-    Py_BEGIN_ALLOW_THREADS
-    rc = nox_v2270_call_2_i64(nox_sub, a, b, &result, &err);
-    Py_END_ALLOW_THREADS
-
-    noxpy_module_lease_release(st);
-    if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
         return NULL;
     }
+
+    int64_t result = 0;
+    NoxHostError *err = NULL;
+    NoxHostStatus rc;
+    Py_BEGIN_ALLOW_THREADS
+    rc = nox_host_export__noxpy_poc_b_sub(ctx, a, b, &result, &err);
+    Py_END_ALLOW_THREADS
+
+    if (rc != NOX_HOST_OK) {
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -88,7 +122,7 @@ static int poc_b_exec(PyObject *module) {
     if (!st) {
         return -1;
     }
-    return noxpy_module_state_init(st, nox_v2270_runtime_ops());
+    return noxpy_module_state_init(st, &g_poc_b_ops);
 }
 
 static void poc_b_free(void *module) {
@@ -103,7 +137,7 @@ PyABIInfo_VAR(noxpy_poc_b_abi_info);
 static PySlot poc_b_slots[] = {
     PySlot_STATIC_DATA(Py_mod_abi, &noxpy_poc_b_abi_info),
     PySlot_STATIC_DATA(Py_mod_name, "_noxpy_poc_b"),
-    PySlot_STATIC_DATA(Py_mod_doc, "Second independent NoxPy Phase 0 abi3t module."),
+    PySlot_STATIC_DATA(Py_mod_doc, "Second independent NoxPy Phase 0 abi3t module via upstream nox_host.h v1."),
     PySlot_SIZE(Py_mod_state_size, sizeof(NoxPyModuleState)),
     PySlot_STATIC_DATA(Py_mod_methods, poc_b_methods),
     PySlot_FUNC(Py_mod_exec, poc_b_exec),

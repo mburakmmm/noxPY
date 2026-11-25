@@ -5,14 +5,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.15+](https://img.shields.io/badge/Python-3.15%2B-3776AB.svg)](https://docs.python.org/3.15/)
 [![ABI: abi3t](https://img.shields.io/badge/ABI-abi3t%20%28free--threaded%29-2EA44F.svg)](docs/adr/0001-cpython-315-dual-abi3t.md)
-[![Phase: 0 (Feasibility)](https://img.shields.io/badge/Phase-0%20Feasibility-orange.svg)](TODO.md)
+[![Phase: 0 Complete -> 1 Ready](https://img.shields.io/badge/Phase-0%20Complete%20%E2%86%92%201%20Ready-brightgreen.svg)](TODO.md)
 
 **Native Python extensions written in [Nox](https://github.com/mburakmmm/nox-lang). Free-threaded first (`abi3t`), safe by design.**
 
 NoxPy combines a native CPython 3.15+ binding layer and a PEP 517/660 build pipeline so developers can author typed Nox modules, compile platform wheels targeting `cp315-abi3.abi3t`, and import them in both ordinary CPython 3.15 and free-threaded CPython `3.15t` without requiring wheel consumers to install `noxc`, Zig, or a C compiler.
 
-> **Current Status (Phase 0 — Compiler & Runtime Feasibility):**
-> NoxPy is in **Phase 0**. Core CPython 3.15 `abi3t` shims, deterministic config/IR/codegen tooling, and an isolated Phase 0 PoC on `noxc v2.2.70` are implemented and verified on CPython 3.15.2 (macOS arm64). **Phase 1 stays gated** until upstream `nox-lang` resolves [`UR-001`–`UR-007`](UPSTREAM_REQUIREMENTS.md) and unforced `python3.15t` CI/local execution is green.
+> **Current Status (Phase 0 Exit Verified on `noxc v2.2.81` + `CPython 3.15.2` & unforced `3.15t`):**
+> All 7 upstream requirements ([`UR-001`–`UR-007`](UPSTREAM_REQUIREMENTS.md)) are resolved in `nox-lang v2.2.75`–`v2.2.81` (`include/nox_host.h` v1, `--host-abi`, `--emit-obj`/`--emit-shared-lib`, `bytes`, `noxc expand --json`). The experimental `--selfhost-obj` bridge is retired, bounded per-module `NoxHostContext` pooling runs in parallel across `3.15.2` and unforced `3.15t`, and **Phase 1 (`0.1 alpha`: PEP 517 wheel builder)** is ready to begin.
 
 ---
 
@@ -39,11 +39,11 @@ Design charter & normative invariants live in [`AGENTS.md`](AGENTS.md):
 | Component | State | Verified Scope |
 |---|---|---|
 | CPython 3.15 `abi3t` core shim ([`noxpy_shim.c`](native/cpython/noxpy_shim.c)) | **Tested** | Compiled `-Wall -Wextra -Werror` (`Py_TARGET_ABI3T=0x030F0000`), symbol-audited, tested (`int64`, `bool`, `float`, `\0`-safe `str`/`bytes`) on CPython 3.15.2 |
-| Config, Binding IR, Stub & C Codegen ([`python/noxpy/`](python/noxpy/)) | **Tested** | 14 unit tests + 2 golden/clang `-Werror` codegen tests |
-| Phase 0 Experimental PoC ([`experiments/phase0_poc/`](experiments/phase0_poc/)) | **Experimental (Gated)** | Genuine `noxc 2.2.70` modules running concurrently across `1/2/4/8` threads (`peak_in_flight=8`), dual-library isolation, empty-stderr teardown |
-| Upstream Blocker Reproducers ([`tests/reproducers/`](tests/reproducers/)) | **Verified (`7/7`)** | `UR-001`–`UR-007` reproduced against `noxc v2.2.70` (`4dc061f8`) |
-| Free-Threaded `python3.15t` Unforced Run | **Pending CI / Local `3.15t`** | [`test_freethreaded_315t.py`](tests/abi/test_freethreaded_315t.py) ready; CI workflow tests both `3.15` and `3.15t` on Ubuntu/macOS |
-| Production Packaging & Wheels (Phases 1–7) | **Gated** | Blocked behind Batch A (`UR-001`–`UR-005`) and Batch B (`UR-007`, `UR-006`) |
+| Config, Binding IR, Stub & C Codegen ([`src/`](src/), [`python/noxpy/`](python/noxpy/)) | **Tested** | Genuine Nox core (`nox.json`, `src/{core,codegen,builder,cli}/*.nox`) verified via `noxc test tests/nox` (`3/3`), Python `tests/unit/` (`24/24`), and byte-for-byte differential + `clang -Werror` CPython 3.15 header check (`tests/codegen/`, `4/4`) |
+| Phase 0 End-to-End Host ABI Suite ([`experiments/phase0_poc/`](experiments/phase0_poc/)) | **Verified** | Genuine `@export` Nox modules built via `--host-abi` (`include/nox_host.h`), concurrent `1/2/4/8` threads (`peak_in_flight=8`), dual-library isolation, `\0`-safe `str`/`bytes`, `ValueError` inspection, `NoxHostHandle` lifecycle |
+| Upstream Contract Verification ([`tests/reproducers/`](tests/reproducers/)) | **Verified (`7/7`)** | `UR-001`–`UR-007` positively verified against `noxc v2.2.81` (`2dcee335`) |
+| Free-Threaded `python3.15t` Unforced Run | **Verified** | [`test_freethreaded_315t.py`](tests/abi/test_freethreaded_315t.py) passes locally on `3.15.0b3t` (`gil_enabled=False`, `peak_in_flight=8`) and in CI |
+| Production Packaging & Wheels (Phase 1 — `0.1 alpha`) | **Unlocked (Next)** | Phase 0 exit gates satisfied; `python/noxpy/build.py` PEP 517 wheel builder next |
 
 ---
 
@@ -55,7 +55,9 @@ Prerequisites: CPython `3.15+`, `clang`, [`rtk`](RTK.md), and (for Phase 0 PoC /
 # 1. Inspect toolchain, CPython 3.15 abi3t headers, and Phase 0 gate status
 PYTHONPATH=python python3.15 -m noxpy doctor
 
-# 2. Run isolated unit & golden codegen tests (includes compiling & auditing abi3t converters)
+# 2. Run genuine Nox unit/codegen tests & Python unit/differential tests
+noxc check src/cli/main.nox
+noxc test tests/nox
 python3.15 -m unittest discover -s tests/unit -v
 python3.15 -m unittest discover -s tests/codegen -v
 
@@ -80,7 +82,8 @@ python3.15 scripts/release/prepare_phase_release.py --dry-run
 - [`docs/RELEASE.md`](docs/RELEASE.md) — Phase-by-phase release runbook, immutable artifact pipeline, and OIDC publishing.
 - [`docs/adr/`](docs/adr/) & [`docs/evidence/`](docs/evidence/) — Architectural Decision Records and recorded verification evidence.
 - [`native/`](native/) — Target `nox_host_abi.h` contract and audited CPython 3.15 `abi3t` C shim.
-- [`python/noxpy/`](python/noxpy/) — Config validator, Binding IR, `.pyi`/C codegen, and `noxpy` CLI (`doctor`, `check`, `generate-stubs`).
+- [`src/`](src/) & [`nox.json`](nox.json) — Upstream-independent NoxPy core written in genuine Nox (`errors`, `ir`, `.pyi`/C codegen, `pyproject.toml` config validator, and `noxpy` Nox CLI).
+- [`python/noxpy/`](python/noxpy/) — Python PEP 517 bootstrap adapter, `pyproject.toml` validator, Binding IR, `.pyi`/C codegen, and `noxpy` CLI (`doctor`, `check`, `generate-stubs`).
 - [`.github/workflows/`](.github/workflows/) — SHA-pinned CI and tag-gated release automation.
 
 ---

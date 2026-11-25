@@ -1,0 +1,415 @@
+# Canonical pyproject.toml parser & validator in genuine Nox (AGENTS.md §5, §15.1).
+
+import nox.fs
+import nox.json
+import nox.strings
+import nox.toml
+from nox.fs import FsError
+from nox.json import JsonWriter
+from nox.toml import TomlError, TomlValue
+from src.codegen.ir import is_valid_ident
+from src.core.errors import NoxPyError, make_error
+
+__all__: list[str] = [
+    "NoxPyProjectConfig",
+    "parse_pyproject_toml",
+    "load_pyproject",
+    "config_to_json",
+]
+
+
+class NoxPyProjectConfig:
+    """Validated NoxPy project configuration extracted from pyproject.toml."""
+
+    distribution_name: str
+    version: str
+    requires_python: str
+    module_name: str
+    leaf_name: str
+    source_rel: str
+    backend: str
+    abi: str
+    free_threaded: bool
+    generate_stubs: bool
+    python_source_rel: str
+
+    def __init__(
+        self,
+        distribution_name: str,
+        version: str,
+        requires_python: str,
+        module_name: str,
+        leaf_name: str,
+        source_rel: str,
+        backend: str,
+        abi: str,
+        free_threaded: bool,
+        generate_stubs: bool,
+        python_source_rel: str,
+    ) -> None:
+        self.distribution_name = distribution_name
+        self.version = version
+        self.requires_python = requires_python
+        self.module_name = module_name
+        self.leaf_name = leaf_name
+        self.source_rel = source_rel
+        self.backend = backend
+        self.abi = abi
+        self.free_threaded = free_threaded
+        self.generate_stubs = generate_stubs
+        self.python_source_rel = python_source_rel
+
+
+def _is_alnum(b: int) -> bool:
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122)
+
+
+def _is_digits(s: str) -> bool:
+    n: int = nox.strings.byte_len(s)
+    if n == 0:
+        return False
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(s, i)
+        if b < 48 or b > 57:
+            return False
+        i += 1
+    return True
+
+
+def _is_valid_dist_name(name: str) -> bool:
+    n: int = nox.strings.byte_len(name)
+    if n == 0:
+        return False
+    if not _is_alnum(nox.strings.byte_at(name, 0)):
+        return False
+    if not _is_alnum(nox.strings.byte_at(name, n - 1)):
+        return False
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(name, i)
+        if not (_is_alnum(b) or b == 46 or b == 95 or b == 45):
+            return False
+        i += 1
+    return True
+
+
+def _is_allowed_tool_key(k: str) -> bool:
+    return (
+        k == "module-name"
+        or k == "source"
+        or k == "backend"
+        or k == "abi"
+        or k == "free-threaded"
+        or k == "generate-stubs"
+        or k == "python-source"
+    )
+
+
+def _parse_requires_python_floor(spec: str, file: str) -> None:
+    raw_clauses: list[str] = nox.strings.split(spec, ",")
+    clauses: list[str] = []
+    for c in raw_clauses:
+        tc: str = nox.strings.trim(c)
+        if tc != "":
+            clauses.append(tc)
+
+    if len(clauses) == 0:
+        raise make_error("NPY-E-ABI", "project.requires-python must not be empty", file, 0, 0, "")
+
+    has_floor: bool = False
+    floor_maj: int = 0
+    floor_min: int = 0
+
+    for clause in clauses:
+        op: str = ""
+        rest: str = ""
+        if nox.strings.starts_with(clause, ">="):
+            op = ">="
+            rest = nox.strings.trim(clause[2:])
+        elif nox.strings.starts_with(clause, "=="):
+            op = "=="
+            rest = nox.strings.trim(clause[2:])
+        elif nox.strings.starts_with(clause, "~="):
+            op = "~="
+            rest = nox.strings.trim(clause[2:])
+        elif nox.strings.starts_with(clause, "<="):
+            op = "<="
+            rest = nox.strings.trim(clause[2:])
+        elif nox.strings.starts_with(clause, "!="):
+            op = "!="
+            rest = nox.strings.trim(clause[2:])
+        elif nox.strings.starts_with(clause, ">"):
+            op = ">"
+            rest = nox.strings.trim(clause[1:])
+        elif nox.strings.starts_with(clause, "<"):
+            op = "<"
+            rest = nox.strings.trim(clause[1:])
+        else:
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Unsupported requires-python specifier clause: '" + clause + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+
+        vparts: list[str] = nox.strings.split(rest, ".")
+        if len(vparts) < 2 or len(vparts) > 3:
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Unsupported requires-python specifier clause: '" + clause + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+        if not _is_digits(vparts[0]) or not _is_digits(vparts[1]):
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Unsupported requires-python specifier clause: '" + clause + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+        if len(vparts) == 3 and vparts[2] != "*" and not _is_digits(vparts[2]):
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Unsupported requires-python specifier clause: '" + clause + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+
+        maj: int = int(vparts[0])
+        min_v: int = int(vparts[1])
+        if op == ">=" or op == "==" or op == "~=":
+            if (not has_floor) or (maj > floor_maj) or (maj == floor_maj and min_v > floor_min):
+                has_floor = True
+                floor_maj = maj
+                floor_min = min_v
+        elif op == ">":
+            bumped_min: int = min_v + 1
+            if (not has_floor) or (maj > floor_maj) or (maj == floor_maj and bumped_min > floor_min):
+                has_floor = True
+                floor_maj = maj
+                floor_min = bumped_min
+
+    if (not has_floor) or (floor_maj < 3) or (floor_maj == 3 and floor_min < 15):
+        raise make_error(
+            "NPY-E-ABI",
+            "NoxPy requires requires-python >= 3.15; got '" + spec + "'",
+            file,
+            0,
+            0,
+            'Set `requires-python = ">=3.15"` in [project].',
+        )
+
+
+def _validate_safe_relpath(rel: str, field: str, file: str) -> str:
+    if nox.strings.trim(rel) == "":
+        raise make_error("NPY-E-CONFIG", "[tool.noxpy]." + field + " must be a non-empty relative path", file, 0, 0, "")
+    if nox.strings.starts_with(rel, "/") or nox.strings.starts_with(rel, "\\"):
+        raise make_error(
+            "NPY-E-CONFIG",
+            "[tool.noxpy]." + field + " must be relative to project root, got '" + rel + "'",
+            file,
+            0,
+            0,
+            "",
+        )
+    if nox.strings.byte_len(rel) >= 2 and nox.strings.byte_at(rel, 1) == 58:
+        raise make_error(
+            "NPY-E-CONFIG",
+            "[tool.noxpy]." + field + " must be relative to project root, got '" + rel + "'",
+            file,
+            0,
+            0,
+            "",
+        )
+    norm: str = nox.strings.replace(rel, "\\", "/")
+    segs: list[str] = nox.strings.split(norm, "/")
+    for seg in segs:
+        if seg == "..":
+            raise make_error(
+                "NPY-E-CONFIG",
+                "[tool.noxpy]." + field + " must not traverse parent directories ('..'): '" + rel + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+    return rel
+
+
+def parse_pyproject_toml(raw_toml: str, source_file: str) -> NoxPyProjectConfig:
+    """Parse and validate pyproject.toml text against AGENTS.md §5 and §15.1."""
+    root: TomlValue = nox.toml.parse("")
+    try:
+        root = nox.toml.parse(raw_toml)
+    except TomlError as e:
+        raise make_error("NPY-E-CONFIG", "Failed to parse pyproject.toml: " + e.message, source_file, 0, 0, "")
+
+    if not nox.toml.is_table(root) or not ("project" in root.tbl) or not nox.toml.is_table(root.tbl["project"]):
+        raise make_error("NPY-E-CONFIG", "Missing [project] table in pyproject.toml", source_file, 0, 0, "")
+    project: dict[str, TomlValue] = root.tbl["project"].tbl
+
+    if not ("name" in project) or not nox.toml.is_string(project["name"]):
+        raise make_error("NPY-E-CONFIG", "Invalid or missing [project].name", source_file, 0, 0, "")
+    dist_name: str = project["name"].s
+    if not _is_valid_dist_name(dist_name):
+        raise make_error("NPY-E-CONFIG", "Invalid [project].name: '" + dist_name + "'", source_file, 0, 0, "")
+
+    if not ("version" in project) or not nox.toml.is_string(project["version"]):
+        raise make_error("NPY-E-CONFIG", "Missing or invalid [project].version", source_file, 0, 0, "")
+    version: str = nox.strings.trim(project["version"].s)
+    if version == "":
+        raise make_error("NPY-E-CONFIG", "Missing or invalid [project].version", source_file, 0, 0, "")
+
+    if not ("requires-python" in project) or not nox.toml.is_string(project["requires-python"]):
+        raise make_error("NPY-E-ABI", "Missing [project].requires-python (must be >=3.15)", source_file, 0, 0, "")
+    req_py: str = nox.strings.trim(project["requires-python"].s)
+    _parse_requires_python_floor(req_py, source_file)
+
+    if not ("tool" in root.tbl) or not nox.toml.is_table(root.tbl["tool"]):
+        raise make_error("NPY-E-CONFIG", "Missing [tool.noxpy] table in pyproject.toml", source_file, 0, 0, "")
+    tool_tbl: dict[str, TomlValue] = root.tbl["tool"].tbl
+    if not ("noxpy" in tool_tbl) or not nox.toml.is_table(tool_tbl["noxpy"]):
+        raise make_error("NPY-E-CONFIG", "Missing [tool.noxpy] table in pyproject.toml", source_file, 0, 0, "")
+    noxpy_tbl: dict[str, TomlValue] = tool_tbl["noxpy"].tbl
+
+    for key in noxpy_tbl:
+        if not _is_allowed_tool_key(key):
+            raise make_error("NPY-E-CONFIG", "Unknown key in [tool.noxpy]: '" + key + "'", source_file, 0, 0, "")
+
+    if not ("module-name" in noxpy_tbl) or not nox.toml.is_string(noxpy_tbl["module-name"]):
+        raise make_error("NPY-E-CONFIG", "Missing [tool.noxpy].module-name", source_file, 0, 0, "")
+    module_name: str = noxpy_tbl["module-name"].s
+    if module_name == "":
+        raise make_error("NPY-E-CONFIG", "Missing [tool.noxpy].module-name", source_file, 0, 0, "")
+    mod_parts: list[str] = nox.strings.split(module_name, ".")
+    for part in mod_parts:
+        if not is_valid_ident(part):
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Invalid Python module-name '" + module_name + "'; every dotted component must be an identifier",
+                source_file,
+                0,
+                0,
+                "",
+            )
+    leaf_name: str = mod_parts[len(mod_parts) - 1]
+
+    if not ("source" in noxpy_tbl) or not nox.toml.is_string(noxpy_tbl["source"]):
+        raise make_error("NPY-E-CONFIG", "Missing [tool.noxpy].source", source_file, 0, 0, "")
+    source_rel: str = _validate_safe_relpath(noxpy_tbl["source"].s, "source", source_file)
+
+    backend: str = "llvm"
+    if "backend" in noxpy_tbl:
+        if not nox.toml.is_string(noxpy_tbl["backend"]):
+            raise make_error("NPY-E-CONFIG", "[tool.noxpy].backend must be a string", source_file, 0, 0, "")
+        backend = noxpy_tbl["backend"].s
+    if backend != "llvm":
+        raise make_error(
+            "NPY-E-CONFIG",
+            "Unsupported backend '" + backend + "'; NoxPy requires 'llvm' (AGENTS.md §0)",
+            source_file,
+            0,
+            0,
+            "",
+        )
+
+    abi: str = "abi3t"
+    if "abi" in noxpy_tbl:
+        if not nox.toml.is_string(noxpy_tbl["abi"]):
+            raise make_error("NPY-E-ABI", "[tool.noxpy].abi must be a string", source_file, 0, 0, "")
+        abi = noxpy_tbl["abi"].s
+    if abi != "abi3t":
+        raise make_error(
+            "NPY-E-ABI",
+            "Unsupported abi '" + abi + "'; default stable target must be 'abi3t'",
+            source_file,
+            0,
+            0,
+            "",
+        )
+
+    free_threaded: bool = True
+    if "free-threaded" in noxpy_tbl:
+        if not nox.toml.is_bool(noxpy_tbl["free-threaded"]):
+            raise make_error("NPY-E-ABI", "[tool.noxpy].free-threaded must be true (AGENTS.md §0)", source_file, 0, 0, "")
+        free_threaded = noxpy_tbl["free-threaded"].b
+    if not free_threaded:
+        raise make_error("NPY-E-ABI", "[tool.noxpy].free-threaded must be true (AGENTS.md §0)", source_file, 0, 0, "")
+
+    generate_stubs: bool = True
+    if "generate-stubs" in noxpy_tbl:
+        if not nox.toml.is_bool(noxpy_tbl["generate-stubs"]):
+            raise make_error("NPY-E-CONFIG", "[tool.noxpy].generate-stubs must be a boolean", source_file, 0, 0, "")
+        generate_stubs = noxpy_tbl["generate-stubs"].b
+
+    py_src_rel: str = ""
+    if "python-source" in noxpy_tbl:
+        if not nox.toml.is_string(noxpy_tbl["python-source"]):
+            raise make_error("NPY-E-CONFIG", "[tool.noxpy].python-source must be a relative path string", source_file, 0, 0, "")
+        py_src_rel = _validate_safe_relpath(noxpy_tbl["python-source"].s, "python-source", source_file)
+
+    return NoxPyProjectConfig(
+        dist_name,
+        version,
+        req_py,
+        module_name,
+        leaf_name,
+        source_rel,
+        backend,
+        abi,
+        free_threaded,
+        generate_stubs,
+        py_src_rel,
+    )
+
+
+def load_pyproject(path: str) -> NoxPyProjectConfig:
+    """Read and validate pyproject.toml from disk."""
+    raw: str = ""
+    try:
+        raw = nox.fs.read_to_string(path)
+    except FsError as e:
+        raise make_error("NPY-E-CONFIG", "Failed to read pyproject.toml: " + e.message, path, 0, 0, "")
+    return parse_pyproject_toml(raw, path)
+
+
+def config_to_json(cfg: NoxPyProjectConfig) -> str:
+    """Serialize validated config to compact JSON."""
+    w: JsonWriter = JsonWriter()
+    w.begin_object()
+    w.write_key("distribution_name")
+    w.write_string(cfg.distribution_name)
+    w.write_key("version")
+    w.write_string(cfg.version)
+    w.write_key("requires_python")
+    w.write_string(cfg.requires_python)
+    w.write_key("module_name")
+    w.write_string(cfg.module_name)
+    w.write_key("leaf_name")
+    w.write_string(cfg.leaf_name)
+    w.write_key("source")
+    w.write_string(cfg.source_rel)
+    w.write_key("backend")
+    w.write_string(cfg.backend)
+    w.write_key("abi")
+    w.write_string(cfg.abi)
+    w.write_key("free_threaded")
+    w.write_bool(cfg.free_threaded)
+    w.write_key("generate_stubs")
+    w.write_bool(cfg.generate_stubs)
+    w.write_key("python_source")
+    if cfg.python_source_rel != "":
+        w.write_string(cfg.python_source_rel)
+    else:
+        w.write_null()
+    w.end_object()
+    return w.build()

@@ -1,0 +1,133 @@
+# Genuine Nox CLI for upstream-independent NoxPy config/IR/codegen workflows.
+
+import nox.fs
+import nox.os
+import nox.strings
+from nox.fs import FsError
+from src.builder.config import NoxPyProjectConfig, config_to_json, load_pyproject
+from src.codegen.emit_c import generate_c_adapter
+from src.codegen.emit_pyi import generate_pyi
+from src.codegen.ir import ModuleIR, module_ir_to_json, parse_upstream_metadata_json
+from src.core.errors import NoxPyError, make_error
+
+
+def _usage() -> str:
+    return (
+        "Usage: noxc run src/cli/main.nox -- <command> [args]\n\n"
+        "Commands:\n"
+        "  check-config <pyproject.toml> [--json]\n"
+        "  check-ir <manifest.json> [--json]\n"
+        "  generate-stubs <manifest.json> [-o <out.pyi>]\n"
+        "  emit-c <manifest.json> [-o <out.c>]\n"
+        "  build                              (blocked on UR-001..UR-007)\n"
+        "  --help\n"
+    )
+
+
+def _read_text(path: str) -> str:
+    try:
+        return nox.fs.read_to_string(path)
+    except FsError as e:
+        raise make_error("NPY-E-CONFIG", "Unable to read file: " + e.message, path, 0, 0, "")
+
+
+def _write_or_print(content: str, out_path: str) -> None:
+    if out_path != "":
+        try:
+            nox.fs.write_string(out_path, content)
+        except FsError as e:
+            raise make_error("NPY-E-CODEGEN", "Failed to write output file: " + e.message, out_path, 0, 0, "")
+    else:
+        if nox.strings.ends_with(content, "\n"):
+            n: int = len(content)
+            print(content[: n - 1])
+        else:
+            print(content)
+
+
+def _run_cli() -> int:
+    argc: int = nox.os.arg_count()
+    if argc < 2:
+        print(_usage())
+        return 0
+
+    cmd: str = nox.os.arg(1)
+    if cmd == "--help" or cmd == "-h" or cmd == "help":
+        print(_usage())
+        return 0
+
+    if cmd == "build":
+        err: NoxPyError = make_error(
+            "NPY-E-UPSTREAM",
+            "Production native wheel build is blocked on upstream nox-lang requirements UR-001 through UR-007 (see UPSTREAM_REQUIREMENTS.md).",
+            "",
+            0,
+            0,
+            "Verify upstream status with `tests/reproducers/run_all.sh` after updating nox-lang.",
+        )
+        print(err.format_human())
+        return 2
+
+    if cmd == "check-config":
+        if argc < 3:
+            print(make_error("NPY-E-CONFIG", "check-config requires <pyproject.toml>", "", 0, 0, "").format_human())
+            return 2
+        cfg_path: str = nox.os.arg(2)
+        as_json: bool = argc >= 4 and nox.os.arg(3) == "--json"
+        cfg: NoxPyProjectConfig = load_pyproject(cfg_path)
+        if as_json:
+            print(config_to_json(cfg))
+        else:
+            print("OK: " + cfg.distribution_name + " (" + cfg.module_name + ", abi=" + cfg.abi + ", free_threaded=true)")
+        return 0
+
+    if cmd == "check-ir":
+        if argc < 3:
+            print(make_error("NPY-E-CODEGEN", "check-ir requires <manifest.json>", "", 0, 0, "").format_human())
+            return 2
+        ir_path: str = nox.os.arg(2)
+        as_json_ir: bool = argc >= 4 and nox.os.arg(3) == "--json"
+        raw_ir: str = _read_text(ir_path)
+        ir: ModuleIR = parse_upstream_metadata_json(raw_ir, "", "abi3t", True)
+        if as_json_ir:
+            print(module_ir_to_json(ir))
+        else:
+            print("OK: " + ir.module_name + " (" + str(len(ir.functions)) + " export(s))")
+        return 0
+
+    if cmd == "generate-stubs" or cmd == "emit-c":
+        if argc < 3:
+            print(make_error("NPY-E-CODEGEN", cmd + " requires <manifest.json> [-o <path>]", "", 0, 0, "").format_human())
+            return 2
+        m_path: str = nox.os.arg(2)
+        out_path: str = ""
+        if argc >= 5 and nox.os.arg(3) == "-o":
+            out_path = nox.os.arg(4)
+        elif argc >= 4 and nox.os.arg(3) != "-o":
+            print(make_error("NPY-E-CONFIG", "Unknown flag '" + nox.os.arg(3) + "'", "", 0, 0, "").format_human())
+            return 2
+        elif argc == 4 and nox.os.arg(3) == "-o":
+            print(make_error("NPY-E-CONFIG", "-o requires an output path", "", 0, 0, "").format_human())
+            return 2
+
+        raw_m: str = _read_text(m_path)
+        mod_ir: ModuleIR = parse_upstream_metadata_json(raw_m, "", "abi3t", True)
+        if cmd == "generate-stubs":
+            _write_or_print(generate_pyi(mod_ir), out_path)
+        else:
+            _write_or_print(generate_c_adapter(mod_ir), out_path)
+        return 0
+
+    print(make_error("NPY-E-CONFIG", "Unknown subcommand '" + cmd + "'", "", 0, 0, "Run with --help.").format_human())
+    return 2
+
+
+exit_code: int = 0
+try:
+    exit_code = _run_cli()
+except NoxPyError as e:
+    print(e.format_human())
+    exit_code = 2
+
+if exit_code != 0:
+    nox.os.exit(exit_code)

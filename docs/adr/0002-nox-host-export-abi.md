@@ -1,33 +1,32 @@
-# ADR-0002: Nox Host Export ABI (`nox_host_abi.h`) & Upstream Feasibility
+# ADR-0002: Nox Host Export ABI (`nox_host.h` v1) & Phase 0 Verification
 
-- **Status:** Proposed (Phase 0 experimental bridge verified on `nox-lang v2.2.70`; upstream `nox_host.h` required before Phase 1)
-- **Date:** 2026-11-25
+- **Status:** Accepted — Verified on `nox-lang v2.2.81` (`2dcee335`) with CPython `3.15.2` and unforced `3.15t`
+- **Date:** 2026-11-25 (updated for `v2.2.81` upstream resolution)
 
 ## Context
 
-Inspection of upstream `nox-lang v2.2.70` (`4dc061f8`) established that:
-1. `docs/apis/internal-abi.md` declares generated symbols (`@nox_add`), `RuntimeState`, `nox_runtime_init`, and `nox_runtime_deinit` private internal ABI subject to change in patch releases.
-2. `include/nox_nni.h` (NNI v1) models Nox calling C plugins, not C/Python hosts calling Nox functions.
-3. `include/nox_embed.h` models a mobile single-app event loop (`nox_app_create`/`nox_app_post_event`/`nox_app_pump`), not multi-function typed exports or host-attached threads.
-4. `noxc` rejects `--emit-obj` / `--emit-static-lib` / `--emit-shared-lib` on desktop targets (`compiler/main.zig:4270`), leaving only the undocumented `--selfhost-obj` flag.
-5. `noxrt.o` exports `752` global `T _nox_*` symbols, `dispatch_registry.zig` holds process-global `var g_*_fn`, and `runtime/errors/handle.zig` terminates the process via `std.process.exit(1)` on OOM/overflow traps.
+On the initial baseline (`nox-lang v2.2.70`), desktop `--emit-obj`/`--emit-shared-lib`, a public `nox_host.h` host contract, binary-safe spans, typed JSON export metadata, and exception inspection were absent (`UR-001`–`UR-007`), requiring a temporary gated Phase 0 bridge (`nox_v2270_bridge`).
+
+Upstream `nox-lang v2.2.75`–`v2.2.81` resolved `UR-001`–`UR-007`:
+1. Desktop PIC `--emit-obj`, `--emit-static-lib`, `--emit-shared-lib` (`v2.2.75`).
+2. `noxc expand --json [--module <name>]` typed export metadata `schema_version = 1` (`v2.2.76`).
+3. Built-in `bytes` and length-aware binary-safe `str` (`v2.2.77`).
+4. Versioned `include/nox_host.h` (experimental `v1`), `--host-abi`, per-context lock + parallel per-thread `NoxHostContext` support, contained exception inspection (`nox_host_error_*`), and generation-checked `NoxHostHandle` (`v2.2.78`).
 
 ## Decision
 
-1. Define a clean, C/C++-compatible host boundary header [`native/include/nox_host_abi.h`](../../native/include/nox_host_abi.h) (`NoxHostRuntimeOps`, `NoxHostStatus`, `NoxHostSpan`, `NoxHostError`, `NoxHostContext`) with `struct_size` + `abi_version` versioning and fixed-width integers.
-2. Document all 7 upstream gaps in [`UPSTREAM_REQUIREMENTS.md`](../../UPSTREAM_REQUIREMENTS.md) (`UR-001`–`UR-007`) with runnable reproducers in `tests/reproducers/`.
-3. For Phase 0 feasibility only, isolate the `v2.2.70` `--selfhost-obj` bridge inside [`experiments/phase0_poc/`](../../experiments/phase0_poc/) behind `-DNOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE=1`:
-   - Never dereference private `RuntimeState` or exception struct layouts.
-   - Use per-call isolated `RuntimeState` (`nox_runtime_init` -> `nox_lib_init` -> call -> `nox_exception_pending`/`take`/`release` -> `nox_lib_fini` -> `nox_runtime_deinit`), eliminating any global invocation mutex and proving multi-thread overlap on foreign OS threads.
-   - Hide all Nox and `noxrt.o` symbols at link time using `-Wl,-dead_strip -Wl,-exported_symbols_list`.
+1. Synchronize [`native/include/nox_host.h`](../../native/include/nox_host.h) with upstream `include/nox_host.h` `v1` and retire the obsolete `v2.2.70` `--selfhost-obj` bridge completely.
+2. Bind per-extension host function pointers into [`NoxPyHostOps`](../../native/include/noxpy_abi.h) (`module_init`, `module_fini`, `context_create`, `context_destroy`, `buffer_release`, `error_*`) with hidden internal visibility and `-Wl,-exported_symbols_list` / `--version-script` exposing only `PyModExport_<leaf>`.
+3. Implement a lock-minimal, bounded per-module `NoxHostContext` pool (`NOXPY_CTX_POOL_CAP = 64`) in [`native/cpython/noxpy_shim.c`](../../native/cpython/noxpy_shim.c) using C11 `atomic_flag` so concurrent Python threads execute in parallel across independent `NoxHostContext` instances with zero global invocation lock (`AGENTS.md` §10).
+4. Always inspect and release `NoxHostError *` while its owning `NoxHostContext *` remains acquired (`noxpy_set_exception_from_host`), and release all `NoxHostBuffer` allocations cleanly via `nox_host_buffer_release`.
+5. Keep fatal runtime limits transparent per `nox_host.h` and `AGENTS.md` §6: recoverable Nox exceptions return `NOX_HOST_ERR_EXCEPTION`, whereas OOM and fixed-width integer overflow traps terminate the process without unwind tables.
 
 ## Alternatives Rejected
 
-- **Global mutex around a single shared `RuntimeState`:** Explicitly forbidden by `AGENTS.md` §0 and §10.4.
-- **Dereferencing internal `RuntimeState` or exception tag offsets:** Explicitly forbidden by `AGENTS.md` §2 and §5.
-- **Overloading `include/nox_nni.h`:** Rejected because NNI v1 is reverse-direction (Nox hosting C plugins).
+- **Sharing one `NoxHostContext` across all Python threads:** Serializes parallel calls on `Context.lock` (`SpinLock`). Rejected by `AGENTS.md` §10.4.
+- **Continuing with `--selfhost-obj` internal symbols:** Prohibited by `AGENTS.md` §2 and §6 now that `--host-abi` and `include/nox_host.h` exist.
 
 ## Consequences
 
-- **Positive:** Phase 0 feasibility is empirically demonstrated on genuine Nox code (`math_mod.nox`, `mod_b.nox`) running concurrently across 8 OS threads in C and CPython 3.15.2 with zero leaked symbols and zero stderr leaks.
-- **Blockers:** Phase 1 MUST NOT start until upstream `nox-lang` delivers `UR-001`–`UR-006` (and `UR-007` for Phase 1 Binding IR) so the gated `nox_v2270_bridge` can be retired cleanly.
+- Phase 0 exit gates (`UR-001`–`UR-007` + unforced `python3.15t` dual-mode import + C host multi-thread + `audit_binary.py`) are satisfied on `noxc 2.2.81` (`2dcee335`) and CPython `3.15.2` / `3.15.0b3t`.
+- Production CPython codegen in [`src/codegen/emit_c.nox`](../../src/codegen/emit_c.nox) and [`python/noxpy/codegen.py`](../../python/noxpy/codegen.py) now targets real `nox_host.h` `v1` directly, unblocking Phase 1 wheel builder implementation.

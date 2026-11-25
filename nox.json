@@ -1,0 +1,7 @@
+{
+  "name": "noxpy",
+  "version": "0.0.0-dev.0",
+  "source": "c",
+  "entry": "src/cli/main.nox",
+  "requires": []
+}

@@ -8,11 +8,11 @@
 
 ## Hard Phase Gate Rule
 
-**Proceed to Phase 1 ONLY when ALL mandatory Phase 0 exit criteria are genuinely satisfied** (including upstream resolution of `UR-001`–`UR-006`, removal of the experimental `--selfhost-obj` Phase 0 bridge, and unforced `python3.15t` dual-mode import verification).
+**Phase 0 Exit Gates Satisfied (`2026-11-25` on `noxc v2.2.81` + `CPython 3.15.2` & unforced `3.15.0b3t`).** `UR-001`–`UR-007` are resolved, the experimental `--selfhost-obj` / `nox_v2270_bridge` is retired in favor of [`native/include/nox_host.h`](native/include/nox_host.h), and dual-mode unforced `python3.15t` execution is verified locally and in CI. **Ready for Phase 1 (`0.1 alpha`).**
 
 ---
 
-## Phase 0 — Compiler / Runtime Feasibility (Current Phase)
+## Phase 0 — Compiler / Runtime Feasibility (Complete)
 
 ### 0.1 Upstream Baseline & Blocker Audit
 - [x] Inspect upstream `nox-lang` source, `AGENTS.md`, `VERSIONING.md`, `include/nox_embed.h`, `include/nox_nni.h`, `docs/apis/internal-abi.md`, `docs/language/ffi.md`, `docs/tools/noxc.md`, `docs/internals/runtime.md`, `docs/stdlib/thread.md`.
@@ -31,6 +31,7 @@
 - [x] Define `native/include/noxpy_abi.h` enforcing `Py_TARGET_ABI3T=0x030F0000`, `PY_VERSION_HEX >= 0x030F0000`, `_Py_OPAQUE_PYOBJECT`, per-module `NoxPyModuleState` lifecycle (`NEW -> INITIALIZING -> READY -> CLOSING -> CLOSED`), and strict conversion/error APIs.
 - [x] Implement & test `native/cpython/noxpy_shim.c` (`int64`, `bool`, `float`, binary-safe UTF-8 `str`, `bytes`) using strictly `abi3t` opaque APIs (`tests/unit/test_shim_converters.py` + `tests/abi/audit_binary.py`, warning-clean `-Wall -Wextra -Werror`).
 - [x] Implement isolated NoxPy-side `python/noxpy/` foundations (`errors.py`, `config.py`, `ir.py`, `codegen.py`, `doctor.py`, `__main__.py`) with fail-closed `noxpy build` (`NPY-E-UPSTREAM`), `tests/unit/`, and `tests/codegen/` (`clang -Werror` check).
+- [x] Implement upstream-independent NoxPy core in genuine Nox (`nox.json`, `src/core/errors.nox`, `src/codegen/{ir,emit_pyi,emit_c}.nox`, `src/builder/config.nox`, `src/cli/main.nox`), runnable Nox test suite (`tests/nox/*_test.nox` via `noxc test tests/nox`), and byte-for-byte differential + `clang -Werror` verification (`tests/codegen/test_nox_vs_python_codegen.py`).
 - [x] Create GitHub repository documentation (`README.md`, `LICENSE`, `SECURITY.md`, `CONTRIBUTING.md`, `CHANGELOG.md`, `pyproject.toml`), `.github/` templates (`CODEOWNERS`, PR/issue templates, `dependabot.yml`), SHA-pinned CI (`.github/workflows/ci.yml`), and phase-by-phase Release pipeline (`.github/workflows/release.yml`, `scripts/release/`, `docs/RELEASE.md`).
 
 ### 0.3 Isolated Phase 0 PoC Spike (`experiments/phase0_poc/`, gated behind `NOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE`)
@@ -42,19 +43,19 @@
 - [x] Audit `.abi3t.so` binaries (`tests/abi/audit_binary.py`): exported symbols allowlist, imported CPython symbol allowlist against `abi3t`, `otool -L` dependency closure, and SHA-256 digests.
 - [x] Create Phase 0 ADRs (`docs/adr/0001-cpython-315-dual-abi3t.md`, `docs/adr/0002-nox-host-export-abi.md`) and evidence record (`docs/evidence/phase0-2026-11-25.md`).
 
-### 0.4 Mandatory Phase 0 Exit Gates (Blocked until upstream + 3.15t resolved)
-- [ ] **Blocked (`python3.15t` missing locally):** Run exact same `.abi3t.so` binaries on free-threaded CPython `3.15t` in a clean subprocess without `-X gil=0`, verifying `not sys._is_gil_enabled()` before and after import plus concurrent multi-thread execution.
-- [ ] **Blocked (`UR-001`):** Upstream `noxc` supports desktop PIC `--emit-obj` / `--emit-static-lib` / `--emit-shared-lib` and PIC `noxrt.o` (without experimental `--selfhost-obj` workaround).
-- [ ] **Blocked (`UR-002`):** Upstream ships versioned `include/nox_host.h` export ABI and stops requiring NoxPy to link unversioned generated symbols with private hidden `rt`.
-- [ ] **Blocked (`UR-003`):** Upstream eliminates process-global mutable `dispatch_registry` / `g_halt_provider` state and provides hidden-visibility runtime archives/objects.
-- [ ] **Blocked (`UR-004`):** Upstream provides a documented foreign-thread attachment / host-context concurrency contract for shared/persistent `RuntimeState` (beyond per-call isolation).
-- [ ] **Blocked (`UR-005`):** Upstream removes `std.process.exit(1)` from host-mode OOM/overflow/unhandled-error paths and provides public exception inspection (`class_name`, `message`, `line`).
-- [ ] **Blocked (`UR-006`):** Upstream provides length-aware UTF-8/bytes spans and generation-checked opaque object handles.
-- [ ] **Blocked (`UR-007`):** Upstream provides machine-readable typed export metadata (`noxc expand --json` or equivalent) for Phase 1 Binding IR.
+### 0.4 Mandatory Phase 0 Exit Gates (Verified Complete on `noxc 2.2.81` + `python3.15t`)
+- [x] **Verified (`uv` `python3.15t` `3.15.0b3`):** Exact same `.abi3t.so` binaries executed on free-threaded CPython `3.15t` in a clean subprocess without `-X gil=0`, confirming `not sys._is_gil_enabled()` before and after import plus 8-thread concurrent overlap (`peak_in_flight=8`).
+- [x] **Resolved (`UR-001` in `v2.2.75`):** Upstream `noxc` supports desktop PIC `--emit-obj` / `--emit-static-lib` / `--emit-shared-lib` and PIC `noxrt.o`; `--selfhost-obj` workaround completely removed from `experiments/phase0_poc/`.
+- [x] **Resolved (`UR-002` in `v2.2.78`):** Upstream ships versioned `include/nox_host.h` (`v1`) and `--host-abi` (`nox_host_module_init/fini`, `nox_host_export_*`); synchronized in [`native/include/nox_host.h`](native/include/nox_host.h) and targeted by [`src/codegen/emit_c.nox`](src/codegen/emit_c.nox) + [`python/noxpy/codegen.py`](python/noxpy/codegen.py).
+- [x] **Resolved (`UR-003` in `v2.2.78`):** Shared libraries via `--emit-shared-lib --host-abi` export strictly `nox_host_*`; two independently built Nox libraries (`libpoc_a`/`libpoc_b`, `_noxpy_poc`/`_noxpy_poc_b`) with overlapping class tags run concurrently with zero `_nox_*` symbol leakage.
+- [x] **Resolved (`UR-004` in `v2.2.78`):** Arbitrary foreign OS threads run safely via independent per-thread `NoxHostContext` pooling in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) (`peak_in_flight=8`, 80-thread churn verified, zero 64-worker cap).
+- [x] **Resolved (`UR-005` in `v2.2.78`, bounded fatal limit documented):** Recoverable Nox exceptions return `NOX_HOST_ERR_EXCEPTION` with public `class_name`/`message`/`line` inspection; OOM and fixed-width overflow traps remain process-fatal per `nox_host.h:25` and `AGENTS.md` §6.
+- [x] **Resolved (`UR-006` in `v2.2.77`+`v2.2.78`):** Length-aware UTF-8/`bytes` spans (`\0`-safe) and generation-checked opaque `NoxHostHandle` verified end-to-end.
+- [x] **Resolved (`UR-007` in `v2.2.76`):** Upstream `noxc expand --json` emits typed schema v1 metadata verified directly against [`src/cli/main.nox`](src/cli/main.nox).
 
 ---
 
-## Phase 1 — `0.1 alpha`: Functions and Wheel (Locked behind Phase 0)
+## Phase 1 — `0.1 alpha`: Functions and Wheel (Next Active Phase)
 - [ ] Replace `experiments/phase0_poc/` experimental bridge with upstream `nox_host.h` production runtime adapter (`src/runtime/`, `native/runtime/`).
 - [ ] Implement deterministic Binding IR schema (`src/codegen/`, `ADR-0004`) fed by upstream typed export metadata (`UR-007`).
 - [ ] Implement primitive type conversions (`int`, `float`, `bool`, `str` with length-aware UTF-8 & embedded NUL, `bytes`, `None`) with exact overflow/strictness checks (`src/types/`, `src/bindings/`).

@@ -1,0 +1,647 @@
+# Deterministic Binding Intermediate Representation (IR) in genuine Nox (AGENTS.md §7, UR-007).
+
+import nox.json
+import nox.strings
+from nox.json import JsonError, JsonWriter
+from src.core.errors import NoxPyError, make_error
+
+__all__: list[str] = [
+    "SourceSpan",
+    "ParamIR",
+    "ExportedFunctionIR",
+    "ModuleIR",
+    "is_valid_ident",
+    "is_reserved_export_name",
+    "is_c_keyword",
+    "is_phase1_param_type",
+    "is_phase1_return_type",
+    "is_valid_param_kind",
+    "is_valid_thread_policy",
+    "parse_upstream_metadata_json",
+    "module_ir_to_json",
+]
+
+IR_SCHEMA_VERSION: int = 1
+
+
+class SourceSpan:
+    """Source file/line/column location for an exported Nox item."""
+
+    file: str
+    line: int
+    column: int
+
+    def __init__(self, file: str, line: int, column: int) -> None:
+        self.file = file
+        self.line = line
+        self.column = column
+
+
+class ParamIR:
+    """Validated parameter signature descriptor in Binding IR."""
+
+    name: str
+    type_name: str
+    kind: str
+    has_default: bool
+
+    def __init__(self, name: str, type_name: str, kind: str, has_default: bool) -> None:
+        self.name = name
+        self.type_name = type_name
+        self.kind = kind
+        self.has_default = has_default
+
+
+class ExportedFunctionIR:
+    """Validated exported function entry in Binding IR."""
+
+    export_id: str
+    name: str
+    c_symbol: str
+    params: list[ParamIR]
+    return_type: str
+    doc: str
+    has_doc: bool
+    thread_policy: str
+    span: SourceSpan
+
+    def __init__(
+        self,
+        export_id: str,
+        name: str,
+        c_symbol: str,
+        params: list[ParamIR],
+        return_type: str,
+        doc: str,
+        has_doc: bool,
+        thread_policy: str,
+        span: SourceSpan,
+    ) -> None:
+        self.export_id = export_id
+        self.name = name
+        self.c_symbol = c_symbol
+        self.params = params
+        self.return_type = return_type
+        self.doc = doc
+        self.has_doc = has_doc
+        self.thread_policy = thread_policy
+        self.span = span
+
+
+class ModuleIR:
+    """Validated module-level Binding IR container."""
+
+    schema_version: int
+    compiler_name: str
+    compiler_version: str
+    compiler_commit: str
+    module_name: str
+    leaf_name: str
+    source: str
+    abi: str
+    free_threaded: bool
+    functions: list[ExportedFunctionIR]
+
+    def __init__(
+        self,
+        schema_version: int,
+        compiler_name: str,
+        compiler_version: str,
+        compiler_commit: str,
+        module_name: str,
+        leaf_name: str,
+        source: str,
+        abi: str,
+        free_threaded: bool,
+        functions: list[ExportedFunctionIR],
+    ) -> None:
+        self.schema_version = schema_version
+        self.compiler_name = compiler_name
+        self.compiler_version = compiler_version
+        self.compiler_commit = compiler_commit
+        self.module_name = module_name
+        self.leaf_name = leaf_name
+        self.source = source
+        self.abi = abi
+        self.free_threaded = free_threaded
+        self.functions = functions
+
+
+def _is_alpha_or_underscore(b: int) -> bool:
+    return (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95
+
+
+def _is_alnum_or_underscore(b: int) -> bool:
+    return _is_alpha_or_underscore(b) or (b >= 48 and b <= 57)
+
+
+def is_valid_ident(s: str) -> bool:
+    """Return True if s matches ^[A-Za-z_][A-Za-z0-9_]*$."""
+    n: int = nox.strings.byte_len(s)
+    if n == 0:
+        return False
+    if not _is_alpha_or_underscore(nox.strings.byte_at(s, 0)):
+        return False
+    i: int = 1
+    while i < n:
+        if not _is_alnum_or_underscore(nox.strings.byte_at(s, i)):
+            return False
+        i += 1
+    return True
+
+
+def is_reserved_export_name(name: str) -> bool:
+    """Return True for reserved dunder or CPython export symbol prefixes."""
+    if (
+        name == "__init__"
+        or name == "__new__"
+        or name == "__del__"
+        or name == "__dict__"
+        or name == "__name__"
+        or name == "__doc__"
+        or name == "__package__"
+        or name == "__loader__"
+        or name == "__spec__"
+    ):
+        return True
+    if nox.strings.starts_with(name, "PyModExport_") or nox.strings.starts_with(name, "PyInit_"):
+        return True
+    return False
+
+
+def is_c_keyword(name: str) -> bool:
+    """Return True if name collides with a C11 reserved keyword."""
+    keywords: dict[str, bool] = {
+        "auto": True,
+        "break": True,
+        "case": True,
+        "char": True,
+        "const": True,
+        "continue": True,
+        "default": True,
+        "do": True,
+        "double": True,
+        "else": True,
+        "enum": True,
+        "extern": True,
+        "float": True,
+        "for": True,
+        "goto": True,
+        "if": True,
+        "inline": True,
+        "int": True,
+        "long": True,
+        "register": True,
+        "restrict": True,
+        "return": True,
+        "short": True,
+        "signed": True,
+        "sizeof": True,
+        "static": True,
+        "struct": True,
+        "switch": True,
+        "typedef": True,
+        "union": True,
+        "unsigned": True,
+        "void": True,
+        "volatile": True,
+        "while": True,
+        "_Atomic": True,
+        "_Bool": True,
+        "_Complex": True,
+    }
+    return name in keywords
+
+
+def is_phase1_param_type(t: str) -> bool:
+    return t == "int" or t == "float" or t == "bool" or t == "str" or t == "bytes"
+
+
+def is_phase1_return_type(t: str) -> bool:
+    return is_phase1_param_type(t) or t == "None"
+
+
+def is_valid_param_kind(k: str) -> bool:
+    return k == "positional_only" or k == "positional_or_keyword" or k == "keyword_only"
+
+
+def is_valid_thread_policy(p: str) -> bool:
+    return p == "parallel" or p == "instance_locked" or p == "thread_affine"
+
+
+def _validate_ident(name: str, what: str, file: str, line: int, col: int) -> str:
+    if not is_valid_ident(name):
+        raise make_error("NPY-E-TYPE", "Invalid " + what + " identifier: '" + name + "'", file, line, col, "")
+    if is_reserved_export_name(name):
+        raise make_error("NPY-E-TYPE", "Reserved " + what + " name rejected: '" + name + "'", file, line, col, "")
+    if is_c_keyword(name):
+        raise make_error(
+            "NPY-E-TYPE",
+            "C reserved keyword cannot be exported as " + what + ": '" + name + "'",
+            file,
+            line,
+            col,
+            "",
+        )
+    return name
+
+
+def _fn_less(a: ExportedFunctionIR, b: ExportedFunctionIR) -> bool:
+    if a.name != b.name:
+        return a.name < b.name
+    return a.export_id < b.export_id
+
+
+def _sort_functions(fns: list[ExportedFunctionIR]) -> list[ExportedFunctionIR]:
+    """Deterministic ascending sort by (name, export_id)."""
+    out: list[ExportedFunctionIR] = []
+    for item in fns:
+        out.append(item)
+    i: int = 1
+    while i < len(out):
+        key: ExportedFunctionIR = out[i]
+        j: int = i - 1
+        while j >= 0 and _fn_less(key, out[j]):
+            out[j + 1] = out[j]
+            j -= 1
+        out[j + 1] = key
+        i += 1
+    return out
+
+
+def _pos_req_obj(doc: JsonValue, parent_pos: int, key: str, missing_msg: str) -> int:
+    p: int = nox.json.pos_find(doc, parent_pos, key)
+    if p < 0 or nox.json.pos_kind(doc, p) != 5:
+        raise make_error("NPY-E-CODEGEN", missing_msg, "", 0, 0, "")
+    return p
+
+
+def _pos_opt_str(doc: JsonValue, parent_pos: int, key: str, default_val: str) -> str:
+    p: int = nox.json.pos_find(doc, parent_pos, key)
+    if p < 0 or nox.json.pos_kind(doc, p) == 0:
+        return default_val
+    if nox.json.pos_kind(doc, p) == 3:
+        return nox.json.pos_str(doc, p)
+    return default_val
+
+
+def parse_upstream_metadata_json(
+    raw_json: str,
+    expected_module_name: str,
+    abi: str,
+    free_threaded: bool,
+) -> ModuleIR:
+    """Validate and lower compiler-owned UR-007 JSON metadata into a deterministic ModuleIR."""
+    doc: JsonValue = nox.json.parse("{}")
+    try:
+        doc = nox.json.parse(raw_json)
+    except JsonError as e:
+        raise make_error("NPY-E-CODEGEN", "Invalid JSON metadata: " + e.message, "", 0, 0, "")
+
+    if not nox.json.is_object(doc):
+        raise make_error("NPY-E-CODEGEN", "Metadata root must be a JSON object", "", 0, 0, "")
+
+    root: int = nox.json.pos_root(doc)
+
+    schema_pos: int = nox.json.pos_find(doc, root, "schema_version")
+    if schema_pos < 0 or nox.json.pos_kind(doc, schema_pos) != 2:
+        raise make_error(
+            "NPY-E-CODEGEN",
+            "Unsupported or missing IR metadata schema_version (expected " + str(IR_SCHEMA_VERSION) + ")",
+            "",
+            0,
+            0,
+            "",
+        )
+    schema_ver: int = 0
+    try:
+        schema_ver = nox.json.pos_int(doc, schema_pos)
+    except JsonError:
+        raise make_error(
+            "NPY-E-CODEGEN",
+            "IR metadata schema_version must be integer " + str(IR_SCHEMA_VERSION),
+            "",
+            0,
+            0,
+            "",
+        )
+    if schema_ver != IR_SCHEMA_VERSION:
+        raise make_error(
+            "NPY-E-CODEGEN",
+            "Unsupported IR metadata schema_version: " + str(schema_ver) + " (expected " + str(IR_SCHEMA_VERSION) + ")",
+            "",
+            0,
+            0,
+            "",
+        )
+
+    comp_pos: int = _pos_req_obj(doc, root, "compiler", "Missing 'compiler' block in metadata")
+    comp_name: str = _pos_opt_str(doc, comp_pos, "name", "")
+    comp_ver: str = _pos_opt_str(doc, comp_pos, "version", "")
+    comp_commit: str = _pos_opt_str(doc, comp_pos, "commit", "")
+    if comp_name != "noxc" or comp_ver == "":
+        raise make_error("NPY-E-CODEGEN", "Invalid compiler identity in metadata (expected name='noxc' and non-empty version)", "", 0, 0, "")
+
+    mod_pos: int = _pos_req_obj(doc, root, "module", "Missing 'module' block in metadata")
+    mod_name: str = _pos_opt_str(doc, mod_pos, "name", "")
+    mod_src: str = _pos_opt_str(doc, mod_pos, "source", "")
+    if mod_name == "":
+        raise make_error("NPY-E-CONFIG", "Invalid module name in metadata: ''", "", 0, 0, "")
+    mod_parts: list[str] = nox.strings.split(mod_name, ".")
+    for part in mod_parts:
+        if not is_valid_ident(part):
+            raise make_error("NPY-E-CONFIG", "Invalid module name in metadata: '" + mod_name + "'", "", 0, 0, "")
+    if expected_module_name != "" and mod_name != expected_module_name:
+        raise make_error(
+            "NPY-E-CONFIG",
+            "Metadata module '" + mod_name + "' does not match pyproject module-name '" + expected_module_name + "'",
+            "",
+            0,
+            0,
+            "",
+        )
+    leaf_name: str = mod_parts[len(mod_parts) - 1]
+
+    exports_pos: int = nox.json.pos_find(doc, root, "exports")
+    if exports_pos < 0 or nox.json.pos_kind(doc, exports_pos) != 4:
+        raise make_error("NPY-E-CODEGEN", "Missing 'exports' list in metadata", "", 0, 0, "")
+
+    seen_names: dict[str, bool] = {}
+    seen_ids: dict[str, bool] = {}
+    seen_syms: dict[str, bool] = {}
+    functions: list[ExportedFunctionIR] = []
+
+    export_count: int = nox.json.pos_len(doc, exports_pos)
+    idx: int = 0
+    while idx < export_count:
+        entry_pos: int = nox.json.pos_at(doc, exports_pos, idx)
+        if nox.json.pos_kind(doc, entry_pos) != 5:
+            raise make_error("NPY-E-CODEGEN", "Export entry #" + str(idx) + " must be an object", "", 0, 0, "")
+
+        span_pos: int = nox.json.pos_find(doc, entry_pos, "span")
+        if span_pos < 0 or nox.json.pos_kind(doc, span_pos) != 5:
+            raise make_error("NPY-E-CODEGEN", "Export entry #" + str(idx) + " missing 'span'", "", 0, 0, "")
+
+        s_file: str = _pos_opt_str(doc, span_pos, "file", "")
+        if s_file == "":
+            s_file = mod_src if mod_src != "" else "<unknown>"
+
+        s_line: int = 0
+        line_pos: int = nox.json.pos_find(doc, span_pos, "line")
+        if line_pos >= 0 and nox.json.pos_kind(doc, line_pos) == 2:
+            try:
+                s_line = nox.json.pos_int(doc, line_pos)
+            except JsonError:
+                s_line = 0
+
+        s_col: int = 1
+        col_pos: int = nox.json.pos_find(doc, span_pos, "column")
+        if col_pos >= 0 and nox.json.pos_kind(doc, col_pos) == 2:
+            try:
+                c_tmp: int = nox.json.pos_int(doc, col_pos)
+                if c_tmp != 0:
+                    s_col = c_tmp
+            except JsonError:
+                s_col = 1
+
+        span: SourceSpan = SourceSpan(s_file, s_line, s_col)
+
+        kind_pos: int = nox.json.pos_find(doc, entry_pos, "kind")
+        if kind_pos < 0 or nox.json.pos_kind(doc, kind_pos) != 3:
+            raise make_error(
+                "NPY-E-TYPE",
+                "Unsupported export kind in Phase 1 IR (only 'function' supported)",
+                s_file,
+                s_line,
+                s_col,
+                "",
+            )
+        kind_val: str = nox.json.pos_str(doc, kind_pos)
+        if kind_val != "function":
+            raise make_error(
+                "NPY-E-TYPE",
+                "Unsupported export kind '" + kind_val + "' in Phase 1 IR (only 'function' supported)",
+                s_file,
+                s_line,
+                s_col,
+                "",
+            )
+
+        name_pos: int = nox.json.pos_find(doc, entry_pos, "name")
+        if name_pos < 0 or nox.json.pos_kind(doc, name_pos) != 3:
+            raise make_error("NPY-E-TYPE", "Invalid function identifier (expected string)", s_file, s_line, s_col, "")
+        fn_name: str = _validate_ident(nox.json.pos_str(doc, name_pos), "function", s_file, s_line, s_col)
+        if fn_name in seen_names:
+            raise make_error("NPY-E-TYPE", "Duplicate exported function name: '" + fn_name + "'", s_file, s_line, s_col, "")
+        seen_names[fn_name] = True
+
+        id_pos: int = nox.json.pos_find(doc, entry_pos, "id")
+        if id_pos < 0 or nox.json.pos_kind(doc, id_pos) != 3:
+            raise make_error("NPY-E-CODEGEN", "Export '" + fn_name + "' missing unique stable 'id'", s_file, s_line, s_col, "")
+        export_id: str = nox.json.pos_str(doc, id_pos)
+        if export_id == "":
+            raise make_error("NPY-E-CODEGEN", "Export '" + fn_name + "' missing unique stable 'id'", s_file, s_line, s_col, "")
+        if export_id in seen_ids:
+            raise make_error("NPY-E-CODEGEN", "Duplicate export id: '" + export_id + "'", s_file, s_line, s_col, "")
+        seen_ids[export_id] = True
+
+        csym_pos: int = nox.json.pos_find(doc, entry_pos, "c_symbol")
+        if csym_pos < 0 or nox.json.pos_kind(doc, csym_pos) != 3:
+            raise make_error("NPY-E-CODEGEN", "Invalid C export symbol for '" + fn_name + "'", s_file, s_line, s_col, "")
+        c_symbol: str = nox.json.pos_str(doc, csym_pos)
+        if not is_valid_ident(c_symbol):
+            raise make_error("NPY-E-CODEGEN", "Invalid C export symbol for '" + fn_name + "': '" + c_symbol + "'", s_file, s_line, s_col, "")
+        if c_symbol in seen_syms:
+            raise make_error("NPY-E-CODEGEN", "Duplicate C symbol: '" + c_symbol + "'", s_file, s_line, s_col, "")
+        seen_syms[c_symbol] = True
+
+        thread_policy: str = "parallel"
+        tp_pos: int = nox.json.pos_find(doc, entry_pos, "thread_policy")
+        if tp_pos >= 0:
+            if nox.json.pos_kind(doc, tp_pos) != 3:
+                raise make_error("NPY-E-TYPE", "Unsupported thread_policy on '" + fn_name + "'", s_file, s_line, s_col, "")
+            thread_policy = nox.json.pos_str(doc, tp_pos)
+            if not is_valid_thread_policy(thread_policy):
+                raise make_error(
+                    "NPY-E-TYPE",
+                    "Unsupported thread_policy '" + thread_policy + "' on '" + fn_name + "'",
+                    s_file,
+                    s_line,
+                    s_col,
+                    "",
+                )
+
+        ret_pos: int = nox.json.pos_find(doc, entry_pos, "return_type")
+        if ret_pos < 0 or nox.json.pos_kind(doc, ret_pos) != 3:
+            raise make_error("NPY-E-TYPE", "Unsupported return type on '" + fn_name + "'", s_file, s_line, s_col, "")
+        ret_ty: str = nox.json.pos_str(doc, ret_pos)
+        if not is_phase1_return_type(ret_ty):
+            raise make_error("NPY-E-TYPE", "Unsupported return type '" + ret_ty + "' on '" + fn_name + "'", s_file, s_line, s_col, "")
+
+        params_pos: int = nox.json.pos_find(doc, entry_pos, "params")
+        if params_pos < 0 or nox.json.pos_kind(doc, params_pos) != 4:
+            raise make_error("NPY-E-CODEGEN", "Export '" + fn_name + "' missing 'params' list", s_file, s_line, s_col, "")
+
+        params: list[ParamIR] = []
+        seen_pnames: dict[str, bool] = {}
+        seen_kw_only: bool = False
+        param_count: int = nox.json.pos_len(doc, params_pos)
+        pidx: int = 0
+        while pidx < param_count:
+            p_pos: int = nox.json.pos_at(doc, params_pos, pidx)
+            if nox.json.pos_kind(doc, p_pos) != 5:
+                raise make_error("NPY-E-CODEGEN", "Invalid param entry on '" + fn_name + "'", s_file, s_line, s_col, "")
+
+            pname_pos: int = nox.json.pos_find(doc, p_pos, "name")
+            if pname_pos < 0 or nox.json.pos_kind(doc, pname_pos) != 3:
+                raise make_error("NPY-E-TYPE", "Invalid parameter identifier on '" + fn_name + "'", s_file, s_line, s_col, "")
+            pname: str = _validate_ident(nox.json.pos_str(doc, pname_pos), "parameter", s_file, s_line, s_col)
+            if pname in seen_pnames:
+                raise make_error("NPY-E-TYPE", "Duplicate parameter '" + pname + "' on '" + fn_name + "'", s_file, s_line, s_col, "")
+            seen_pnames[pname] = True
+
+            ptype_pos: int = nox.json.pos_find(doc, p_pos, "type")
+            if ptype_pos < 0 or nox.json.pos_kind(doc, ptype_pos) != 3:
+                raise make_error("NPY-E-TYPE", "Unsupported parameter type for " + fn_name + "." + pname, s_file, s_line, s_col, "")
+            ptype: str = nox.json.pos_str(doc, ptype_pos)
+            if not is_phase1_param_type(ptype):
+                raise make_error(
+                    "NPY-E-TYPE",
+                    "Unsupported parameter type '" + ptype + "' for " + fn_name + "." + pname,
+                    s_file,
+                    s_line,
+                    s_col,
+                    "",
+                )
+
+            pkind: str = "positional_or_keyword"
+            pk_pos: int = nox.json.pos_find(doc, p_pos, "kind")
+            if pk_pos >= 0:
+                if nox.json.pos_kind(doc, pk_pos) != 3:
+                    raise make_error("NPY-E-TYPE", "Unsupported parameter kind for " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                pkind = nox.json.pos_str(doc, pk_pos)
+                if not is_valid_param_kind(pkind):
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Unsupported parameter kind '" + pkind + "' for " + fn_name + "." + pname,
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
+
+            if pkind == "positional_only" and seen_kw_only:
+                raise make_error("NPY-E-TYPE", "Invalid parameter order in '" + fn_name + "'", s_file, s_line, s_col, "")
+            if pkind == "keyword_only":
+                seen_kw_only = True
+
+            has_default: bool = False
+            hd_pos: int = nox.json.pos_find(doc, p_pos, "has_default")
+            if hd_pos >= 0:
+                hd_kind: int = nox.json.pos_kind(doc, hd_pos)
+                if hd_kind == 1:
+                    has_default = nox.json.pos_bool(doc, hd_pos)
+                elif hd_kind == 2:
+                    has_default = nox.json.pos_number(doc, hd_pos) != 0.0
+                elif hd_kind == 3:
+                    has_default = nox.json.pos_str(doc, hd_pos) != ""
+            if has_default:
+                raise make_error(
+                    "NPY-E-TYPE",
+                    "Default values are not yet supported in Phase 1 IR for " + fn_name + "." + pname,
+                    s_file,
+                    s_line,
+                    s_col,
+                    "",
+                )
+
+            params.append(ParamIR(pname, ptype, pkind, has_default))
+            pidx += 1
+
+        doc_str: str = ""
+        has_doc: bool = False
+        doc_pos: int = nox.json.pos_find(doc, entry_pos, "doc")
+        if doc_pos >= 0:
+            dk: int = nox.json.pos_kind(doc, doc_pos)
+            if dk == 0:
+                has_doc = False
+            elif dk == 3:
+                doc_str = nox.json.pos_str(doc, doc_pos)
+                has_doc = True
+            else:
+                raise make_error("NPY-E-CODEGEN", "Docstring for '" + fn_name + "' must be string or null", s_file, s_line, s_col, "")
+
+        functions.append(
+            ExportedFunctionIR(
+                export_id,
+                fn_name,
+                c_symbol,
+                params,
+                ret_ty,
+                doc_str,
+                has_doc,
+                thread_policy,
+                span,
+            )
+        )
+        idx += 1
+
+    sorted_fns: list[ExportedFunctionIR] = _sort_functions(functions)
+    return ModuleIR(
+        IR_SCHEMA_VERSION,
+        comp_name,
+        comp_ver,
+        comp_commit,
+        mod_name,
+        leaf_name,
+        mod_src,
+        abi,
+        free_threaded,
+        sorted_fns,
+    )
+
+
+def module_ir_to_json(ir: ModuleIR) -> str:
+    """Serialize validated ModuleIR summary to compact JSON."""
+    w: JsonWriter = JsonWriter()
+    w.begin_object()
+    w.write_key("schema_version")
+    w.write_int(ir.schema_version)
+    w.write_key("compiler_name")
+    w.write_string(ir.compiler_name)
+    w.write_key("compiler_version")
+    w.write_string(ir.compiler_version)
+    w.write_key("compiler_commit")
+    w.write_string(ir.compiler_commit)
+    w.write_key("module_name")
+    w.write_string(ir.module_name)
+    w.write_key("leaf_name")
+    w.write_string(ir.leaf_name)
+    w.write_key("source")
+    w.write_string(ir.source)
+    w.write_key("abi")
+    w.write_string(ir.abi)
+    w.write_key("free_threaded")
+    w.write_bool(ir.free_threaded)
+    w.write_key("export_count")
+    w.write_int(len(ir.functions))
+    w.write_key("exports")
+    w.begin_array()
+    for fn in ir.functions:
+        w.begin_object()
+        w.write_key("id")
+        w.write_string(fn.export_id)
+        w.write_key("name")
+        w.write_string(fn.name)
+        w.write_key("c_symbol")
+        w.write_string(fn.c_symbol)
+        w.write_key("return_type")
+        w.write_string(fn.return_type)
+        w.write_key("thread_policy")
+        w.write_string(fn.thread_policy)
+        w.write_key("arity")
+        w.write_int(len(fn.params))
+        w.end_object()
+    w.end_array()
+    w.end_object()
+    return w.build()

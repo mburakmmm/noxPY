@@ -1,5 +1,0 @@
-_poc_a_add
-_poc_a_fib
-_poc_a_work_loop
-_poc_a_checked_div
-_poc_a_alloc_checksum

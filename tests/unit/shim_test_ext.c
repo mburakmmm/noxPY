@@ -12,13 +12,28 @@ static void dummy_ctx_destroy(NoxHostContext *ctx) {
     (void)ctx;
 }
 
-static const NoxHostRuntimeOps g_dummy_ops = {
-    .struct_size = (uint32_t)sizeof(NoxHostRuntimeOps),
+static NoxHostStatus dummy_mod_init(NoxHostContext *ctx, NoxHostError **err) {
+    (void)ctx;
+    (void)err;
+    return NOX_HOST_OK;
+}
+
+static void dummy_mod_fini(NoxHostContext *ctx) {
+    (void)ctx;
+}
+
+static const NoxPyHostOps g_dummy_ops = {
+    .struct_size = (uint32_t)sizeof(NoxPyHostOps),
     .abi_version = NOX_HOST_ABI_VERSION,
-    .capabilities = NOX_HOST_CAP_PARALLEL_CALLS,
     .context_create = dummy_ctx_create,
     .context_destroy = dummy_ctx_destroy,
-    .error_clear = NULL,
+    .module_init = dummy_mod_init,
+    .module_fini = dummy_mod_fini,
+    .buffer_release = NULL,
+    .error_release = NULL,
+    .error_line = NULL,
+    .error_class_name = NULL,
+    .error_message = NULL,
 };
 
 static PyObject *test_i64(PyObject *self, PyObject *arg) {

@@ -12,12 +12,67 @@ static int span_eq_cstr(NoxHostSpan span, const char *lit) {
     return span.len == lit_len && memcmp(span.data, lit, lit_len) == 0;
 }
 
-int noxpy_module_state_init(NoxPyModuleState *st, const NoxHostRuntimeOps *ops) {
+static void pool_lock_acquire(atomic_flag *flag) {
+    while (atomic_flag_test_and_set_explicit(flag, memory_order_acquire)) {
+        sched_yield();
+    }
+}
+
+static void pool_lock_release(atomic_flag *flag) {
+    atomic_flag_clear_explicit(flag, memory_order_release);
+}
+
+static void destroy_host_context(const NoxPyHostOps *ops, NoxHostContext *ctx) {
+    if (!ops || !ctx) {
+        return;
+    }
+    if (ops->module_fini) {
+        ops->module_fini(ctx);
+    }
+    if (ops->context_destroy) {
+        ops->context_destroy(ctx);
+    }
+}
+
+static int create_and_init_context(const NoxPyHostOps *ops, NoxHostContext **out_ctx) {
+    *out_ctx = NULL;
+    if (!ops || !ops->context_create) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: host ops missing context_create");
+        return -1;
+    }
+    NoxHostContextConfig cfg = {
+        .size = (uint32_t)sizeof(NoxHostContextConfig),
+        .abi_version = NOX_HOST_ABI_VERSION,
+        .allocator = NULL,
+    };
+    NoxHostContext *ctx = NULL;
+    NoxHostStatus rc = ops->context_create(&cfg, &ctx);
+    if (rc != NOX_HOST_OK || !ctx) {
+        noxpy_set_exception_from_host(ops, rc == NOX_HOST_OK ? NOX_HOST_ERR_NOMEM : rc, NULL);
+        return -1;
+    }
+    if (ops->module_init) {
+        NoxHostError *err = NULL;
+        rc = ops->module_init(ctx, &err);
+        if (rc != NOX_HOST_OK) {
+            /* Error MUST be inspected & released before destroying ctx (nox_host.h). */
+            noxpy_set_exception_from_host(ops, rc, err);
+            if (ops->context_destroy) {
+                ops->context_destroy(ctx);
+            }
+            return -1;
+        }
+    }
+    *out_ctx = ctx;
+    return 0;
+}
+
+int noxpy_module_state_init(NoxPyModuleState *st, const NoxPyHostOps *ops) {
     if (!st) {
         PyErr_SetString(PyExc_SystemError, "noxpy: NULL module state");
         return -1;
     }
-    if (!ops || ops->struct_size < sizeof(NoxHostRuntimeOps) || ops->abi_version != NOX_HOST_ABI_VERSION) {
+    if (!ops || ops->struct_size < sizeof(NoxPyHostOps) || ops->abi_version != NOX_HOST_ABI_VERSION) {
         PyErr_SetString(PyExc_RuntimeError, "noxpy: incompatible Nox host ABI ops table");
         return -1;
     }
@@ -27,22 +82,21 @@ int noxpy_module_state_init(NoxPyModuleState *st, const NoxHostRuntimeOps *ops) 
     atomic_store_explicit(&st->active_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&st->current_in_flight, 0, memory_order_relaxed);
     atomic_store_explicit(&st->peak_in_flight, 0, memory_order_relaxed);
-    st->runtime_ops = ops;
-    st->host_ctx = NULL;
-
-    if (ops->context_create) {
-        NoxHostContextConfig cfg = {
-            .struct_size = (uint32_t)sizeof(NoxHostContextConfig),
-            .abi_version = NOX_HOST_ABI_VERSION,
-            .flags = 0,
-        };
-        NoxHostStatus rc = ops->context_create(&cfg, &st->host_ctx);
-        if (rc != NOX_HOST_OK) {
-            atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
-            noxpy_set_exception_from_host(rc, NULL);
-            return -1;
-        }
+    st->host_ops = ops;
+    atomic_flag_clear_explicit(&st->pool_lock, memory_order_relaxed);
+    st->pool_count = 0;
+    for (size_t i = 0; i < NOXPY_CTX_POOL_CAP; i++) {
+        st->pool[i] = NULL;
     }
+
+    /* Eagerly initialize one warm context to validate module init on import. */
+    NoxHostContext *warm = NULL;
+    if (create_and_init_context(ops, &warm) < 0) {
+        atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
+        return -1;
+    }
+    st->pool[0] = warm;
+    st->pool_count = 1;
 
     atomic_store_explicit(&st->lifecycle, NOXPY_MOD_READY, memory_order_release);
     return 0;
@@ -77,6 +131,48 @@ void noxpy_module_lease_release(NoxPyModuleState *st) {
     atomic_fetch_sub_explicit(&st->active_calls, 1, memory_order_release);
 }
 
+int noxpy_module_ctx_acquire(NoxPyModuleState *st, NoxHostContext **out_ctx) {
+    if (!st || !out_ctx || !st->host_ops) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid module context acquire state");
+        return -1;
+    }
+    *out_ctx = NULL;
+
+    NoxHostContext *ctx = NULL;
+    pool_lock_acquire(&st->pool_lock);
+    if (st->pool_count > 0) {
+        st->pool_count--;
+        ctx = st->pool[st->pool_count];
+        st->pool[st->pool_count] = NULL;
+    }
+    pool_lock_release(&st->pool_lock);
+
+    if (ctx) {
+        *out_ctx = ctx;
+        return 0;
+    }
+    return create_and_init_context(st->host_ops, out_ctx);
+}
+
+void noxpy_module_ctx_release(NoxPyModuleState *st, NoxHostContext *ctx) {
+    if (!st || !ctx) {
+        return;
+    }
+    int cached = 0;
+    if (atomic_load_explicit(&st->lifecycle, memory_order_acquire) == NOXPY_MOD_READY) {
+        pool_lock_acquire(&st->pool_lock);
+        if (st->pool_count < NOXPY_CTX_POOL_CAP) {
+            st->pool[st->pool_count] = ctx;
+            st->pool_count++;
+            cached = 1;
+        }
+        pool_lock_release(&st->pool_lock);
+    }
+    if (!cached) {
+        destroy_host_context(st->host_ops, ctx);
+    }
+}
+
 void noxpy_module_state_close(NoxPyModuleState *st) {
     if (!st || st->struct_size != sizeof(NoxPyModuleState)) {
         return;
@@ -91,9 +187,19 @@ void noxpy_module_state_close(NoxPyModuleState *st) {
         sched_yield();
     }
 
-    if (st->runtime_ops && st->runtime_ops->context_destroy && st->host_ctx) {
-        st->runtime_ops->context_destroy(st->host_ctx);
-        st->host_ctx = NULL;
+    NoxHostContext *local_ctxs[NOXPY_CTX_POOL_CAP];
+    size_t local_count = 0;
+    pool_lock_acquire(&st->pool_lock);
+    local_count = st->pool_count;
+    for (size_t i = 0; i < local_count; i++) {
+        local_ctxs[i] = st->pool[i];
+        st->pool[i] = NULL;
+    }
+    st->pool_count = 0;
+    pool_lock_release(&st->pool_lock);
+
+    for (size_t i = 0; i < local_count; i++) {
+        destroy_host_context(st->host_ops, local_ctxs[i]);
     }
 
     atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
@@ -224,6 +330,19 @@ PyObject *noxpy_utf8_span_to_py(NoxHostSpan span) {
     return PyUnicode_DecodeUTF8(ptr, (Py_ssize_t)span.len, "strict");
 }
 
+PyObject *noxpy_utf8_buffer_to_py(const NoxPyHostOps *ops, NoxHostBuffer *buf) {
+    if (!buf) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: NULL NoxHostBuffer");
+        return NULL;
+    }
+    NoxHostSpan sp = { .data = buf->data, .len = buf->len };
+    PyObject *res = noxpy_utf8_span_to_py(sp);
+    if (ops && ops->buffer_release) {
+        ops->buffer_release(buf);
+    }
+    return res;
+}
+
 int noxpy_py_to_bytes_span_strict(PyObject *obj, NoxHostSpan *out, const char *arg_name) {
     const char *label = arg_name ? arg_name : "?";
     if (!obj || !out) {
@@ -261,62 +380,90 @@ PyObject *noxpy_bytes_span_to_py(NoxHostSpan span) {
     return PyBytes_FromStringAndSize(ptr, (Py_ssize_t)span.len);
 }
 
-static PyObject *pick_exc_type(NoxHostStatus status, const NoxHostError *err) {
-    if (err && err->class_name.data && err->class_name.len > 0) {
-        if (span_eq_cstr(err->class_name, "ValueError")) return PyExc_ValueError;
-        if (span_eq_cstr(err->class_name, "TypeError")) return PyExc_TypeError;
-        if (span_eq_cstr(err->class_name, "OverflowError")) return PyExc_OverflowError;
-        if (span_eq_cstr(err->class_name, "MemoryError")) return PyExc_MemoryError;
-        if (span_eq_cstr(err->class_name, "IndexError")) return PyExc_IndexError;
-        if (span_eq_cstr(err->class_name, "KeyError")) return PyExc_KeyError;
-        if (span_eq_cstr(err->class_name, "ZeroDivisionError")) return PyExc_ZeroDivisionError;
+PyObject *noxpy_bytes_buffer_to_py(const NoxPyHostOps *ops, NoxHostBuffer *buf) {
+    if (!buf) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: NULL NoxHostBuffer");
+        return NULL;
+    }
+    NoxHostSpan sp = { .data = buf->data, .len = buf->len };
+    PyObject *res = noxpy_bytes_span_to_py(sp);
+    if (ops && ops->buffer_release) {
+        ops->buffer_release(buf);
+    }
+    return res;
+}
+
+static PyObject *pick_exc_type(NoxHostStatus status, NoxHostSpan class_name) {
+    if (class_name.data && class_name.len > 0) {
+        if (span_eq_cstr(class_name, "ValueError")) return PyExc_ValueError;
+        if (span_eq_cstr(class_name, "TypeError")) return PyExc_TypeError;
+        if (span_eq_cstr(class_name, "OverflowError")) return PyExc_OverflowError;
+        if (span_eq_cstr(class_name, "MemoryError")) return PyExc_MemoryError;
+        if (span_eq_cstr(class_name, "IndexError")) return PyExc_IndexError;
+        if (span_eq_cstr(class_name, "KeyError")) return PyExc_KeyError;
+        if (span_eq_cstr(class_name, "ZeroDivisionError")) return PyExc_ZeroDivisionError;
     }
     switch (status) {
-        case NOX_HOST_ERR_OVERFLOW:
-            return PyExc_OverflowError;
-        case NOX_HOST_ERR_OOM:
+        case NOX_HOST_ERR_NOMEM:
             return PyExc_MemoryError;
-        case NOX_HOST_ERR_INVALID_ARG:
+        case NOX_HOST_ERR_UTF8:
+        case NOX_HOST_ERR_INVAL:
+        case NOX_HOST_ERR_INVALID_HANDLE:
             return PyExc_ValueError;
-        case NOX_HOST_ERR_UNSUPPORTED:
-            return PyExc_NotImplementedError;
         case NOX_HOST_ERR_VERSION:
         case NOX_HOST_ERR_STATE:
         case NOX_HOST_ERR_EXCEPTION:
-        case NOX_HOST_ERR_INTERNAL:
         default:
             return PyExc_RuntimeError;
     }
 }
 
-void noxpy_set_exception_from_host(NoxHostStatus status, const NoxHostError *err) {
-    PyObject *exc_type = pick_exc_type(status, err);
-    if (err && err->message.data && err->message.len > 0) {
-        int msg_len = err->message.len > (size_t)INT_MAX ? INT_MAX : (int)err->message.len;
-        if (err->class_name.data && err->class_name.len > 0) {
-            int cls_len = err->class_name.len > (size_t)INT_MAX ? INT_MAX : (int)err->class_name.len;
+void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status, NoxHostError *err) {
+    NoxHostSpan class_name = {0};
+    NoxHostSpan message = {0};
+    int64_t line = 0;
+
+    if (err && ops) {
+        if (ops->error_class_name) {
+            (void)ops->error_class_name(err, &class_name);
+        }
+        if (ops->error_message) {
+            (void)ops->error_message(err, &message);
+        }
+        if (ops->error_line) {
+            line = ops->error_line(err);
+        }
+    }
+
+    PyObject *exc_type = pick_exc_type(status, class_name);
+    if (message.data && message.len > 0) {
+        int msg_len = message.len > (size_t)INT_MAX ? INT_MAX : (int)message.len;
+        if (class_name.data && class_name.len > 0) {
+            int cls_len = class_name.len > (size_t)INT_MAX ? INT_MAX : (int)class_name.len;
             PyErr_Format(
                 exc_type,
                 "%.*s: %.*s (line %lld)",
                 cls_len,
-                (const char *)err->class_name.data,
+                (const char *)class_name.data,
                 msg_len,
-                (const char *)err->message.data,
-                (long long)err->line);
+                (const char *)message.data,
+                (long long)line);
         } else {
-            PyErr_Format(exc_type, "%.*s", msg_len, (const char *)err->message.data);
+            PyErr_Format(exc_type, "%.*s", msg_len, (const char *)message.data);
         }
-        return;
-    }
-    if (err && err->class_name.data && err->class_name.len > 0) {
-        int cls_len = err->class_name.len > (size_t)INT_MAX ? INT_MAX : (int)err->class_name.len;
+    } else if (class_name.data && class_name.len > 0) {
+        int cls_len = class_name.len > (size_t)INT_MAX ? INT_MAX : (int)class_name.len;
         PyErr_Format(
             exc_type,
             "Nox exception '%.*s' (line %lld)",
             cls_len,
-            (const char *)err->class_name.data,
-            (long long)err->line);
-        return;
+            (const char *)class_name.data,
+            (long long)line);
+    } else {
+        PyErr_Format(exc_type, "Nox host error status=%d", (int)status);
     }
-    PyErr_Format(exc_type, "Nox host error status=%d", (int)status);
+
+    if (err && ops && ops->error_release) {
+        ops->error_release(err);
+    }
 }

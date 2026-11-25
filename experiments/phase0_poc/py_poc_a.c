@@ -1,15 +1,41 @@
-#ifndef NOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE
-#  error "py_poc_a.c requires NOXPY_PHASE0_EXPERIMENTAL_SELFHOST_BRIDGE"
-#endif
-
 #include "noxpy_abi.h"
-#include "nox_v2270_bridge.h"
 
-extern int64_t nox_add(void *rt, int64_t a, int64_t b);
-extern int64_t nox_fib(void *rt, int64_t n);
-extern int64_t nox_work_loop(void *rt, int64_t iters, int64_t seed);
-extern int64_t nox_checked_div(void *rt, int64_t a, int64_t b);
-extern int64_t nox_alloc_checksum(void *rt, int64_t n);
+/*
+ * Phase 0 CPython 3.15 abi3t proof-of-concept binding against upstream `nox_host.h` v1.
+ * Compiled via `noxc build --backend llvm --host-abi --module-name _noxpy_poc --emit-obj`.
+ */
+
+extern NoxHostStatus nox_host_module_init__noxpy_poc(NoxHostContext *ctx, NoxHostError **err);
+extern void nox_host_module_fini__noxpy_poc(NoxHostContext *ctx);
+
+extern NoxHostStatus nox_host_export__noxpy_poc_add(
+    NoxHostContext *ctx, int64_t a, int64_t b, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_fib(
+    NoxHostContext *ctx, int64_t n, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_work_loop(
+    NoxHostContext *ctx, int64_t iters, int64_t seed, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_checked_div(
+    NoxHostContext *ctx, int64_t a, int64_t b, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_alloc_checksum(
+    NoxHostContext *ctx, int64_t n, int64_t *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_echo_str(
+    NoxHostContext *ctx, const uint8_t *data, size_t len, NoxHostBuffer *out, NoxHostError **err);
+extern NoxHostStatus nox_host_export__noxpy_poc_echo_bytes(
+    NoxHostContext *ctx, const uint8_t *data, size_t len, NoxHostBuffer *out, NoxHostError **err);
+
+static const NoxPyHostOps g_poc_a_ops = {
+    .struct_size = (uint32_t)sizeof(NoxPyHostOps),
+    .abi_version = NOX_HOST_ABI_VERSION,
+    .context_create = nox_host_context_create,
+    .context_destroy = nox_host_context_destroy,
+    .module_init = nox_host_module_init__noxpy_poc,
+    .module_fini = nox_host_module_fini__noxpy_poc,
+    .buffer_release = nox_host_buffer_release,
+    .error_release = nox_host_error_release,
+    .error_line = nox_host_error_line,
+    .error_class_name = nox_host_error_class_name,
+    .error_message = nox_host_error_message,
+};
 
 static NoxPyModuleState *get_mod_state(PyObject *module) {
     NoxPyModuleState *st = (NoxPyModuleState *)PyModule_GetState(module);
@@ -34,24 +60,29 @@ static PyObject *py_nox_add(PyObject *module, PyObject *const *args, Py_ssize_t 
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
 
     int64_t result = 0;
-    NoxHostError err = {0};
+    NoxHostError *err = NULL;
     NoxHostStatus rc;
     Py_BEGIN_ALLOW_THREADS
     noxpy_module_inflight_enter(st);
-    rc = nox_v2270_call_2_i64(nox_add, a, b, &result, &err);
+    rc = nox_host_export__noxpy_poc_add(ctx, a, b, &result, &err);
     noxpy_module_inflight_exit(st);
     Py_END_ALLOW_THREADS
 
-    noxpy_module_lease_release(st);
     if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
-        if (st->runtime_ops && st->runtime_ops->error_clear) {
-            st->runtime_ops->error_clear(&err);
-        }
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
         return NULL;
     }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -72,24 +103,29 @@ static PyObject *py_nox_fib(PyObject *module, PyObject *const *args, Py_ssize_t 
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
 
     int64_t result = 0;
-    NoxHostError err = {0};
+    NoxHostError *err = NULL;
     NoxHostStatus rc;
     Py_BEGIN_ALLOW_THREADS
     noxpy_module_inflight_enter(st);
-    rc = nox_v2270_call_1_i64(nox_fib, n, &result, &err);
+    rc = nox_host_export__noxpy_poc_fib(ctx, n, &result, &err);
     noxpy_module_inflight_exit(st);
     Py_END_ALLOW_THREADS
 
-    noxpy_module_lease_release(st);
     if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
-        if (st->runtime_ops && st->runtime_ops->error_clear) {
-            st->runtime_ops->error_clear(&err);
-        }
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
         return NULL;
     }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -107,24 +143,29 @@ static PyObject *py_nox_work_loop(PyObject *module, PyObject *const *args, Py_ss
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
 
     int64_t result = 0;
-    NoxHostError err = {0};
+    NoxHostError *err = NULL;
     NoxHostStatus rc;
     Py_BEGIN_ALLOW_THREADS
     noxpy_module_inflight_enter(st);
-    rc = nox_v2270_call_2_i64(nox_work_loop, iters, seed, &result, &err);
+    rc = nox_host_export__noxpy_poc_work_loop(ctx, iters, seed, &result, &err);
     noxpy_module_inflight_exit(st);
     Py_END_ALLOW_THREADS
 
-    noxpy_module_lease_release(st);
     if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
-        if (st->runtime_ops && st->runtime_ops->error_clear) {
-            st->runtime_ops->error_clear(&err);
-        }
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
         return NULL;
     }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -142,24 +183,29 @@ static PyObject *py_nox_checked_div(PyObject *module, PyObject *const *args, Py_
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
 
     int64_t result = 0;
-    NoxHostError err = {0};
+    NoxHostError *err = NULL;
     NoxHostStatus rc;
     Py_BEGIN_ALLOW_THREADS
     noxpy_module_inflight_enter(st);
-    rc = nox_v2270_call_2_i64(nox_checked_div, a, b, &result, &err);
+    rc = nox_host_export__noxpy_poc_checked_div(ctx, a, b, &result, &err);
     noxpy_module_inflight_exit(st);
     Py_END_ALLOW_THREADS
 
-    noxpy_module_lease_release(st);
     if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
-        if (st->runtime_ops && st->runtime_ops->error_clear) {
-            st->runtime_ops->error_clear(&err);
-        }
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
         return NULL;
     }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
 }
 
@@ -176,25 +222,108 @@ static PyObject *py_nox_alloc_checksum(PyObject *module, PyObject *const *args, 
     if (!st || noxpy_module_lease_acquire(st) < 0) {
         return NULL;
     }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
 
     int64_t result = 0;
-    NoxHostError err = {0};
+    NoxHostError *err = NULL;
     NoxHostStatus rc;
     Py_BEGIN_ALLOW_THREADS
     noxpy_module_inflight_enter(st);
-    rc = nox_v2270_call_1_i64(nox_alloc_checksum, n, &result, &err);
+    rc = nox_host_export__noxpy_poc_alloc_checksum(ctx, n, &result, &err);
     noxpy_module_inflight_exit(st);
     Py_END_ALLOW_THREADS
 
-    noxpy_module_lease_release(st);
     if (rc != NOX_HOST_OK) {
-        noxpy_set_exception_from_host(rc, &err);
-        if (st->runtime_ops && st->runtime_ops->error_clear) {
-            st->runtime_ops->error_clear(&err);
-        }
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
         return NULL;
     }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
     return noxpy_i64_to_py(result);
+}
+
+static PyObject *py_nox_echo_str(PyObject *module, PyObject *const *args, Py_ssize_t nargs) {
+    if (nargs != 1) {
+        PyErr_Format(PyExc_TypeError, "echo_str() takes exactly 1 argument (%zd given)", nargs);
+        return NULL;
+    }
+    NoxHostSpan sp = {0};
+    if (noxpy_py_to_utf8_span_strict(args[0], &sp, "s") < 0) {
+        return NULL;
+    }
+    NoxPyModuleState *st = get_mod_state(module);
+    if (!st || noxpy_module_lease_acquire(st) < 0) {
+        return NULL;
+    }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+
+    NoxHostBuffer out = {0};
+    NoxHostError *err = NULL;
+    NoxHostStatus rc;
+    Py_BEGIN_ALLOW_THREADS
+    noxpy_module_inflight_enter(st);
+    rc = nox_host_export__noxpy_poc_echo_str(ctx, sp.data, sp.len, &out, &err);
+    noxpy_module_inflight_exit(st);
+    Py_END_ALLOW_THREADS
+
+    if (rc != NOX_HOST_OK) {
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
+    return noxpy_utf8_buffer_to_py(st->host_ops, &out);
+}
+
+static PyObject *py_nox_echo_bytes(PyObject *module, PyObject *const *args, Py_ssize_t nargs) {
+    if (nargs != 1) {
+        PyErr_Format(PyExc_TypeError, "echo_bytes() takes exactly 1 argument (%zd given)", nargs);
+        return NULL;
+    }
+    NoxHostSpan sp = {0};
+    if (noxpy_py_to_bytes_span_strict(args[0], &sp, "raw") < 0) {
+        return NULL;
+    }
+    NoxPyModuleState *st = get_mod_state(module);
+    if (!st || noxpy_module_lease_acquire(st) < 0) {
+        return NULL;
+    }
+    NoxHostContext *ctx = NULL;
+    if (noxpy_module_ctx_acquire(st, &ctx) < 0) {
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+
+    NoxHostBuffer out = {0};
+    NoxHostError *err = NULL;
+    NoxHostStatus rc;
+    Py_BEGIN_ALLOW_THREADS
+    noxpy_module_inflight_enter(st);
+    rc = nox_host_export__noxpy_poc_echo_bytes(ctx, sp.data, sp.len, &out, &err);
+    noxpy_module_inflight_exit(st);
+    Py_END_ALLOW_THREADS
+
+    if (rc != NOX_HOST_OK) {
+        noxpy_set_exception_from_host(st->host_ops, rc, err);
+        noxpy_module_ctx_release(st, ctx);
+        noxpy_module_lease_release(st);
+        return NULL;
+    }
+    noxpy_module_ctx_release(st, ctx);
+    noxpy_module_lease_release(st);
+    return noxpy_bytes_buffer_to_py(st->host_ops, &out);
 }
 
 static PyObject *py_peak_in_flight(PyObject *module, PyObject *Py_UNUSED(ignored)) {
@@ -220,6 +349,8 @@ static PyMethodDef poc_a_methods[] = {
     {"work_loop", _PyCFunction_CAST(py_nox_work_loop), METH_FASTCALL, "CPU loop via native Nox."},
     {"checked_div", _PyCFunction_CAST(py_nox_checked_div), METH_FASTCALL, "Division with Nox exception containment."},
     {"alloc_checksum", _PyCFunction_CAST(py_nox_alloc_checksum), METH_FASTCALL, "Nox list allocation checksum."},
+    {"echo_str", _PyCFunction_CAST(py_nox_echo_str), METH_FASTCALL, "Round-trip binary-safe UTF-8 str via NoxHostBuffer."},
+    {"echo_bytes", _PyCFunction_CAST(py_nox_echo_bytes), METH_FASTCALL, "Round-trip raw bytes via NoxHostBuffer."},
     {"peak_in_flight", py_peak_in_flight, METH_NOARGS, "Return peak concurrent in-flight native calls."},
     {"reset_peak_in_flight", py_reset_peak_in_flight, METH_NOARGS, "Reset peak concurrent in-flight counter."},
     {NULL, NULL, 0, NULL}
@@ -230,7 +361,7 @@ static int poc_a_exec(PyObject *module) {
     if (!st) {
         return -1;
     }
-    return noxpy_module_state_init(st, nox_v2270_runtime_ops());
+    return noxpy_module_state_init(st, &g_poc_a_ops);
 }
 
 static void poc_a_free(void *module) {
@@ -245,7 +376,7 @@ PyABIInfo_VAR(noxpy_poc_a_abi_info);
 static PySlot poc_a_slots[] = {
     PySlot_STATIC_DATA(Py_mod_abi, &noxpy_poc_a_abi_info),
     PySlot_STATIC_DATA(Py_mod_name, "_noxpy_poc"),
-    PySlot_STATIC_DATA(Py_mod_doc, "NoxPy Phase 0 experimental abi3t proof-of-concept module."),
+    PySlot_STATIC_DATA(Py_mod_doc, "NoxPy Phase 0 abi3t proof-of-concept module via upstream nox_host.h v1."),
     PySlot_SIZE(Py_mod_state_size, sizeof(NoxPyModuleState)),
     PySlot_STATIC_DATA(Py_mod_methods, poc_a_methods),
     PySlot_FUNC(Py_mod_exec, poc_a_exec),

@@ -216,8 +216,10 @@ jobs:
             --portable --fetch --json
           "${{ steps.py_gil.outputs.python-path }}" -m noxpy build "$WORK/noxen_wrap" --out-dir "$WORK/dist" --release --json
           WHL="$(ls "$WORK"/dist/noxpy_noxen-*.whl)"
+          IDX=0
           for PY in "${{ steps.py_gil.outputs.python-path }}" "${{ steps.py_ft.outputs.python-path }}"; do
-            V="$WORK/venv_$(basename "$PY")"
+            IDX=$((IDX + 1))
+            V="$WORK/venv_$IDX"
             uv venv --quiet --python "$PY" "$V"
             uv pip install --quiet --python "$V/bin/python" "$WHL"
             "$V/bin/python" -c 'import noxen_upstream as nx; assert nx.is_valid_email("alice@example.org") is True; assert nx.is_valid_ipv4("192.168.1.1") is True'

@@ -242,7 +242,7 @@ jobs:
           NOX_INC="$HOME/.nox-lang/include"
           NOXRT="$HOME/.nox-lang/lib/noxrt.o"
           noxc build --backend llvm --host-abi --module-name hello --emit-obj -o "$WORK/hello_nox.o" "$WORK/hello/src/hello.nox"
-          "${{ steps.py_gil.outputs.python-path }}" -m noxpy generate-stubs "$WORK/hello" --emit-c > "$WORK/hello_adapter.c"
+          "${{ steps.py_gil.outputs.python-path }}" -c "from pathlib import Path; from noxpy.build import inspect_module_ir; from noxpy.config import load_pyproject; from noxpy.codegen import generate_c_adapter; p = Path('$WORK/hello'); Path('$WORK/hello_adapter.c').write_text(generate_c_adapter(inspect_module_ir(p, load_pyproject(p / 'pyproject.toml'))), encoding='utf-8')"
           clang -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
             -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
             -shared -I"$PWD/native/include" -I"$NOX_INC" -I"$PY_INC" \

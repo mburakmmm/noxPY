@@ -140,7 +140,7 @@ jobs:
               PYTHONPATH=build_ci_san \
               "${{ steps.py_gil.outputs.python-path }}" -c 'import _noxpy_shim_test as m; assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"'
           fi
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: abi3t-shim-${{ runner.os }}
           path: build_ci/_noxpy_shim_test.abi3t.so

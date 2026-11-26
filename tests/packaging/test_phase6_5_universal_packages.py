@@ -73,6 +73,25 @@ class TestPhase65UniversalPackages(unittest.TestCase):
                 encoding="utf-8",
             )
             (upstream / "main.nox").write_text('import arith\nprint(arith.weighted_sum([1.0, 2.0]))\n', encoding="utf-8")
+            (upstream / "sub").mkdir()
+            (upstream / "sub" / "acc.nox").write_text(
+                """
+class Acc:
+    total: int
+    def __init__(self, start: int = 0) -> None:
+        self.total = start
+    def add(self, delta: int) -> int:
+        self.total = self.total + delta
+        return self.total
+    @property
+    def value(self) -> int:
+        return self.total
+    @staticmethod
+    def zero() -> int:
+        return 0
+""",
+                encoding="utf-8",
+            )
             (upstream / "arith.nox").write_text(
                 """
 def weighted_sum(xs: list[float], scale: float = 1.0) -> float:
@@ -97,19 +116,27 @@ def clamp_i64(v: int, lo: int = 0, hi: int = 100) -> int:
             subprocess.run(["git", "commit", "-m", "initial unmodified nox package"], cwd=upstream, check=True, capture_output=True)
 
             wrap_dir = tmp / "mymath_wrapper"
-            info = generate_package_wrapper(upstream, wrap_dir, module_name="mymath_native", fetch=True)
+            info = generate_package_wrapper(
+                upstream, wrap_dir, module_name="mymath_native", multi_module=True, include_classes=True, fetch=True
+            )
             self.assertEqual(sorted(info["exported_functions"]), ["clamp_i64", "weighted_sum"])
+            self.assertEqual(info["exported_classes"], ["Acc"])
             self.assertTrue((wrap_dir / "nox.lock").is_file())
 
             wheel_res = build_project_wheel(wrap_dir, tmp / "dist", release=True, use_cache=False)
 
             check_script = """
 import array, sys
-import mymath_native as m
-assert m.weighted_sum([1.5, 2.5, 3.0], scale=2.0) == 14.0
-assert m.weighted_sum(array.array("d", [10.0, 20.0])) == 30.0
-assert m.clamp_i64(-5) == 0
-assert m.clamp_i64(250, hi=99) == 99
+import mymath_native.arith as arith
+from mymath_native.sub.acc import Acc
+assert arith.weighted_sum([1.5, 2.5, 3.0], scale=2.0) == 14.0
+assert arith.weighted_sum(array.array("d", [10.0, 20.0])) == 30.0
+assert arith.clamp_i64(-5) == 0
+assert arith.clamp_i64(250, hi=99) == 99
+a = Acc(10)
+assert a.add(5) == 15
+assert a.value == 15
+assert Acc.zero() == 0
 expect_gil = sys.argv[1] == "1"
 assert sys._is_gil_enabled() is expect_gil
 print("UNIV_PKG_OK", sys._is_gil_enabled())

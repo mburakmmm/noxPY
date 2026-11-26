@@ -120,7 +120,17 @@
 
 ---
 
-## Phase 7 — `1.0` Stable Release (Locked behind Phase 6)
+## Phase 7A — Hardening, Windows `.pyd`, `manylinux` & Universal Package Bindings v2 (Verified on `noxc 2.2.99`, pending CI)
+- [x] Author isolated `UR-016` upstream specification ([`docs/upstream/ur016-universal-package-bindings.md`](docs/upstream/ur016-universal-package-bindings.md)) and executable reproducer ([`tests/reproducers/ur016_universal_package_bindings.sh`](tests/reproducers/ur016_universal_package_bindings.sh)).
+- [x] Eliminate NumPy `writable_array()` UAF on escaped views/slices via `weakref`-guarded pin retention + `as_writable_ndarray()` ([`python/noxpy/numpy_adapter.py`](python/noxpy/numpy_adapter.py), [`ADR-0008`](docs/adr/0008-buffers-numpy-ownership.md)).
+- [x] Remove `PyGILState_Ensure()` fallback in `noxpy_interp_attach()` and add per-interpreter `atexit` shutdown barrier (`active_attaches` + `active_async_ops`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c), verified by [`tests/stress/test_phase7a_soak.py`](tests/stress/test_phase7a_soak.py).
+- [x] Verify real `NumPy` (`2.5.5`) + `PyArrow` (`26.0.1`, incl. `pa.chunked_array` C Stream) interop (`3.15` & `3.15t` NumPy + Arrow PyCapsule, with honest local `3.15.0b3t` `pyarrow.lib` import probe).
+- [x] Upgrade Universal Package Bindings v2 (`pkg_bridge.py`: `--portable`, `--repo-url`, `--multi-module`, nested modules, `/` & `*` parameter kinds, and automatic non-generic public class wrappers).
+- [x] Add pure-Python PE32+ Windows `.pyd` auditor ([`python/noxpy/audit.py`](python/noxpy/audit.py)), Windows `.pyd` linking & `NOXPY_PLATFORM_TAG` (`manylinux`) in [`python/noxpy/build.py`](python/noxpy/build.py), and upgrade [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+---
+
+## Phase 7 — `1.0` Stable Release (Locked behind Phase 6 / `UR-016`)
 - [ ] Finalize stable config, Binding IR schema, and dual `abi3`/`abi3t` policy; publish compatibility matrix.
 - [ ] Complete `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, API docs, and migration guides.
 - [ ] Run full Section 19 CI pipeline (formatting, unit, codegen, upstream contract, native build, ABI/dependency audit, wheel install, thread/GC/stress/fuzz, P0 matrix).

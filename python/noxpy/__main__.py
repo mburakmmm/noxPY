@@ -196,6 +196,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
             module_name=args.module_name,
             modules=mods,
             select=sel,
+            git_ref=args.git_ref,
+            repo_url=args.repo_url,
+            portable=bool(args.portable),
+            multi_module=bool(args.multi_module),
+            include_classes=not bool(args.no_classes),
             fetch=bool(args.fetch),
         )
         if args.json:
@@ -278,7 +283,12 @@ def main(argv: list[str] | None = None) -> int:
     p_init.add_argument("--out", "-o", help="Output directory for generated wrapper project.")
     p_init.add_argument("--module-name", help="Python module name for generated wrapper.")
     p_init.add_argument("--modules", help="Comma-separated Nox module names to inspect/wrap.")
-    p_init.add_argument("--select", help="Comma-separated exported function names to include.")
+    p_init.add_argument("--select", help="Comma-separated exported function/class names to include.")
+    p_init.add_argument("--repo-url", help="Explicit git remote URL for portable nox.json dependencies.")
+    p_init.add_argument("--git-ref", help="Explicit git commit/tag/branch ref for nox.json dependencies.")
+    p_init.add_argument("--portable", action="store_true", help="Resolve git origin remote URL instead of local path.")
+    p_init.add_argument("--multi-module", action="store_true", help="Emit Python submodule namespace (<pkg>._native + python/<pkg>/<mod>.py).")
+    p_init.add_argument("--no-classes", action="store_true", help="Skip generating wrappers for non-generic public classes.")
     p_init.add_argument("--fetch", action="store_true", help="Run `noxc fetch` to generate nox.lock.")
     p_init.add_argument("--json", action="store_true")
     p_init.set_defaults(func=_cmd_init)

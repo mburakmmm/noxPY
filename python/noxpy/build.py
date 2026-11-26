@@ -66,12 +66,25 @@ def normalize_dist_name(name: str) -> str:
     return re.sub(r"[-_.]+", "_", name).lower()
 
 
+def _ext_filename(leaf_name: str) -> str:
+    if sys.platform == "win32":
+        return f"{leaf_name}.pyd"
+    return f"{leaf_name}.abi3t.so"
+
+
 def compute_platform_tag() -> str:
     """Compute supported PEP 425 platform tag aligned with compiler deployment target."""
+    override = os.environ.get("NOXPY_PLATFORM_TAG", "").strip()
+    if override:
+        if not re.fullmatch(r"[A-Za-z0-9_]+", override):
+            raise NoxPyError("NPY-E-CONFIG", f"Invalid NOXPY_PLATFORM_TAG value: {override!r}")
+        return override
     if sys.platform == "darwin":
         mach = platform.machine().lower()
         arch = "arm64" if mach in ("arm64", "aarch64") else "x86_64"
         return f"macosx_14_0_{arch}"
+    if sys.platform == "win32":
+        return "win_amd64"
     return sysconfig.get_platform().replace("-", "_").replace(".", "_")
 
 
@@ -112,10 +125,11 @@ def _find_native_root() -> Path:
 
 
 def _find_nox_toolchain() -> tuple[Path, Path, Path, str, str, str]:
+    exe_suffix = ".exe" if sys.platform == "win32" else ""
     noxc = os.environ.get("NOXC") or shutil.which("noxc")
     if not noxc:
-        home_cand = Path.home() / ".nox-lang" / "bin" / "noxc"
-        if home_cand.is_file() and os.access(home_cand, os.X_OK):
+        home_cand = Path.home() / ".nox-lang" / "bin" / f"noxc{exe_suffix}"
+        if home_cand.is_file() and (sys.platform == "win32" or os.access(home_cand, os.X_OK)):
             noxc = str(home_cand)
     if not noxc:
         raise NoxPyError(
@@ -125,7 +139,16 @@ def _find_nox_toolchain() -> tuple[Path, Path, Path, str, str, str]:
         )
     noxc_p = Path(noxc).resolve()
     prefix = noxc_p.parent.parent
-    noxrt_p = Path(os.environ.get("NOXRT") or (prefix / "lib" / "noxrt.o")).resolve()
+    noxrt_env = os.environ.get("NOXRT")
+    if noxrt_env:
+        noxrt_p = Path(noxrt_env).resolve()
+    elif sys.platform == "win32":
+        noxrt_p = next(
+            (c.resolve() for c in (prefix / "lib" / "noxrt.obj", prefix / "lib" / "noxrt.o", prefix / "lib" / "noxrt.lib") if c.is_file()),
+            (prefix / "lib" / "noxrt.obj").resolve(),
+        )
+    else:
+        noxrt_p = (prefix / "lib" / "noxrt.o").resolve()
     nox_inc = Path(os.environ.get("NOX_INCLUDE") or (prefix / "include")).resolve()
 
     if not noxrt_p.is_file():
@@ -143,6 +166,14 @@ def _find_nox_toolchain() -> tuple[Path, Path, Path, str, str, str]:
 
 def _find_c_compiler() -> str:
     cc = os.environ.get("CC") or shutil.which("clang") or shutil.which("cc")
+    if not cc and sys.platform == "win32":
+        for cand in (
+            r"C:\Program Files\LLVM\bin\clang.exe",
+            r"C:\Program Files (x86)\LLVM\bin\clang.exe",
+        ):
+            if Path(cand).is_file():
+                cc = cand
+                break
     if not cc:
         raise NoxPyError("NPY-E-CONFIG", "C11 compiler (clang or cc) not found on PATH")
     return cc
@@ -374,8 +405,9 @@ def _compile_and_audit_extension(
 ) -> tuple[bytes, str | None, tuple[str, ...], AuditResult, str, str, str, bool]:
     native_root = _find_native_root()
     noxc_p, noxrt_p, nox_inc, noxc_ver, noxc_sha, noxrt_sha = _find_nox_toolchain()
-    if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
+    if sys.platform not in ("darwin", "win32") and not sys.platform.startswith("linux"):
         raise NoxPyError("NPY-E-CONFIG", f"Extension linking not yet implemented on {sys.platform}")
+    ext_fname = _ext_filename(cfg.leaf_name)
     cc = _find_c_compiler()
     cc_version = _c_compiler_version(cc)
     lock_digest = compute_lock_digest(proj_root)
@@ -395,7 +427,7 @@ def _compile_and_audit_extension(
     )
     cache_root = proj_root / ".noxpy-cache"
     cache_entry = cache_root / cache_key
-    cached_so = cache_entry / f"{cfg.leaf_name}.abi3t.so"
+    cached_so = cache_entry / ext_fname
     cached_meta = cache_entry / "meta.json"
     cached_pyi = cache_entry / f"{cfg.leaf_name}.pyi"
 
@@ -417,11 +449,11 @@ def _compile_and_audit_extension(
 
     with tempfile.TemporaryDirectory(prefix="noxpy-build-") as td:
         work = Path(td)
-        nox_obj = work / f"{cfg.leaf_name}_nox.o"
+        nox_obj = work / (f"{cfg.leaf_name}_nox.obj" if sys.platform == "win32" else f"{cfg.leaf_name}_nox.o")
         adapter_c = work / f"{cfg.leaf_name}_adapter.c"
-        adapter_o = work / f"{cfg.leaf_name}_adapter.o"
-        shim_o = work / "noxpy_shim.o"
-        so_path = work / f"{cfg.leaf_name}.abi3t.so"
+        adapter_o = work / (f"{cfg.leaf_name}_adapter.obj" if sys.platform == "win32" else f"{cfg.leaf_name}_adapter.o")
+        shim_o = work / ("noxpy_shim.obj" if sys.platform == "win32" else "noxpy_shim.o")
+        so_path = work / ext_fname
 
         adapter_c.write_text(c_src, encoding="utf-8")
 
@@ -453,12 +485,12 @@ def _compile_and_audit_extension(
             "-Wall",
             "-Wextra",
             "-Werror",
-            "-fPIC",
-            "-fvisibility=hidden",
             f"-I{native_root / 'include'}",
             f"-I{nox_inc}",
             f"-I{py_inc}",
         ]
+        if sys.platform != "win32":
+            cflags.extend(["-fPIC", "-fvisibility=hidden"])
         if sys.platform == "darwin":
             cflags.append("-mmacosx-version-min=14.0")
 
@@ -491,6 +523,32 @@ def _compile_and_audit_extension(
                 str(nox_obj),
                 str(noxrt_p),
                 "-lm",
+            ]
+        elif sys.platform == "win32":
+            py3_lib = Path(sys.base_prefix) / "libs" / "python3.lib"
+            if not py3_lib.is_file():
+                raise NoxPyError(
+                    "NPY-E-ABI",
+                    f"Missing Windows stable ABI import library: {py3_lib}",
+                    hint="Ensure CPython 3.15+ Windows install includes libs/python3.lib.",
+                )
+            link_cmd = [
+                cc,
+                "-shared",
+                "-o",
+                str(so_path),
+                str(adapter_o),
+                str(shim_o),
+                str(nox_obj),
+                str(noxrt_p),
+                str(py3_lib),
+                f"-Wl,/EXPORT:PyModExport_{cfg.leaf_name}",
+                "-lws2_32",
+                "-lbcrypt",
+                "-ladvapi32",
+                "-luser32",
+                "-lntdll",
+                "-lkernel32",
             ]
         else:
             ver_file = work / "exports.ver"
@@ -532,7 +590,7 @@ def _compile_and_audit_extension(
         cache_root.mkdir(parents=True, exist_ok=True)
         tmp_cache = Path(tempfile.mkdtemp(prefix=f".{cache_key[:12]}-tmp-", dir=str(cache_root)))
         try:
-            (tmp_cache / f"{cfg.leaf_name}.abi3t.so").write_bytes(so_bytes)
+            (tmp_cache / ext_fname).write_bytes(so_bytes)
             if pyi_src is not None:
                 (tmp_cache / f"{cfg.leaf_name}.pyi").write_text(pyi_src, encoding="utf-8")
             (tmp_cache / "meta.json").write_text(
@@ -585,7 +643,8 @@ def build_project_wheel(
 
     wheel_files: dict[str, tuple[bytes, int]] = {}
     pkg_prefix = "/".join(cfg.package_parts[:-1])
-    ext_rel = f"{pkg_prefix}/{cfg.leaf_name}.abi3t.so" if pkg_prefix else f"{cfg.leaf_name}.abi3t.so"
+    ext_fname = _ext_filename(cfg.leaf_name)
+    ext_rel = f"{pkg_prefix}/{ext_fname}" if pkg_prefix else ext_fname
     wheel_files[ext_rel] = (so_bytes, 0o755)
 
     if pyi_src is not None:
@@ -659,7 +718,7 @@ def build_project_editable_wheel(
         ext_dir = base_dir
 
     ext_dir.mkdir(parents=True, exist_ok=True)
-    ext_file = ext_dir / f"{cfg.leaf_name}.abi3t.so"
+    ext_file = ext_dir / _ext_filename(cfg.leaf_name)
     ext_file.write_bytes(so_bytes)
     os.chmod(ext_file, 0o755)
 

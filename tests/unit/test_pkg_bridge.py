@@ -29,13 +29,13 @@ class TestPkgBridge(unittest.TestCase):
         (root / "core.nox").write_text(
             net_line
             + """
-__all__: list[str] = ["add_nums", "greet_opt", "scale_list", "gen_id", "bad_obj", "Widget", "Box", "_private_fn"]
+__all__: list[str] = ["add_nums", "greet_opt", "scale_list", "gen_id", "bad_obj", "Widget", "OpaqueWidget", "Box", "_private_fn"]
 
 def _private_fn(x: int) -> int:
     return x
 
-def add_nums(a: int, b: int = 5) -> int:
-    return a + b
+def add_nums(a: int, /, b: int = 5, *, scale: int = 1) -> int:
+    return (a + b) * scale
 
 def greet_opt(name: str | None) -> str:
     return name if name is not None else "anon"
@@ -56,6 +56,12 @@ class Widget:
     x: int
     def __init__(self, x: int) -> None:
         self.x = x
+    def bump(self, d: int = 1) -> int:
+        return self.x + d
+
+class OpaqueWidget:
+    def __init__(self, w: Widget) -> None:
+        pass
 
 class Box[T]:
     v: T
@@ -79,6 +85,11 @@ class Box[T]:
             exp_names = [f["name"] for f in rep["exportable"]]
             self.assertEqual(exp_names, ["add_nums", "greet_opt", "scale_list"])
             self.assertNotIn("_private_fn", exp_names)
+            add_params = rep["exportable"][0]["params"]
+            self.assertEqual([p["kind"] for p in add_params], ["positional_only", "positional_or_keyword", "keyword_only"])
+
+            exp_cls_names = [f"{c['module']}.{c['name']}" for c in rep["exportable_classes"]]
+            self.assertIn("core.Widget", exp_cls_names)
 
             spec_symbols = [x.get("name") or x.get("symbol") for x in rep["needs_specialization"]]
             self.assertIn("gen_id", spec_symbols)
@@ -86,7 +97,7 @@ class Box[T]:
 
             unsup_symbols = [x.get("name") or x.get("symbol") for x in rep["unsupported"]]
             self.assertIn("bad_obj", unsup_symbols)
-            self.assertIn("core.Widget", unsup_symbols)
+            self.assertIn("core.OpaqueWidget", unsup_symbols)
 
     def test_generate_wrapper_and_config_export_key(self) -> None:
         with tempfile.TemporaryDirectory(prefix="noxpy-bridge-gen-") as td:
@@ -102,9 +113,29 @@ class Box[T]:
 
             lib_src = (out / "src" / "lib.nox").read_text(encoding="utf-8")
             self.assertIn("import samplepkg.core", lib_src)
-            self.assertIn("@export\ndef add_nums(a: int, b: int = 5) -> int:", lib_src)
-            self.assertIn("return samplepkg.core.add_nums(a, b)", lib_src)
+            self.assertIn("@export\ndef add_nums(a: int, b: int = 5, scale: int = 1) -> int:", lib_src)
+            self.assertIn("return samplepkg.core.add_nums(a, b, scale)", lib_src)
             self.assertIn("return samplepkg.core.scale_list(xs, factor)", lib_src)
+
+            # Portable remote + multi-module + class wrapper generation
+            mm_out = tmp / "wrapped_mm"
+            mm_res = generate_package_wrapper(
+                pkg,
+                mm_out,
+                module_name="sample_mm",
+                repo_url="https://github.com/example/samplepkg.git",
+                git_ref="deadbeef",
+                multi_module=True,
+                include_classes=True,
+            )
+            self.assertTrue(mm_res["dependency_portable"])
+            self.assertEqual(mm_res["module_name"], "sample_mm._native")
+            self.assertIn("Widget", mm_res["exported_classes"])
+            self.assertTrue((mm_out / "python" / "sample_mm" / "__init__.py").is_file())
+            self.assertTrue((mm_out / "python" / "sample_mm" / "core.py").is_file())
+            mm_nox_json = json.loads((mm_out / "nox.json").read_text(encoding="utf-8"))
+            self.assertEqual(mm_nox_json["requires"][0]["repo"], "https://github.com/example/samplepkg.git")
+            self.assertEqual(mm_nox_json["requires"][0]["ref"], "deadbeef")
 
             nox_json = json.loads((out / "nox.json").read_text(encoding="utf-8"))
             self.assertEqual(nox_json["requires"][0]["alias"], "samplepkg")

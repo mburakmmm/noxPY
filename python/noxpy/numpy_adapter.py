@@ -6,6 +6,7 @@ explicitly by user code that already depends on NumPy.
 
 from __future__ import annotations
 
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -35,35 +36,51 @@ def as_ndarray(buf: Any) -> Any:
     return arr
 
 
+def as_writable_ndarray(buf: Any) -> Any:
+    """Return an exclusive zero-copy writable `numpy.ndarray` view over a Nox buffer.
+
+    Unlike `writable_array()`, the returned `ndarray` owns the PEP 3118 exclusive pin via
+    its `base` `memoryview` until the array and all derived slices/views are garbage-collected.
+    Raises `BufferError` if another view already pins the buffer.
+    """
+    np = _require_numpy()
+    proxy = buf.writable()
+    mv = memoryview(proxy)
+    return np.frombuffer(mv, dtype=np.dtype(mv.format))
+
+
 @contextmanager
-def writable_array(buf: Any) -> Iterator[Any]:
+def writable_array(buf: Any, *, strict: bool = False) -> Iterator[Any]:
     """Acquire an exclusive zero-copy writable `numpy.ndarray` view over a Nox buffer.
 
-    Guarantees deterministic unpinning on exit (so subsequent Nox `resize()` or new
-    pins never see leaked exclusive locks) and revokes write permission on `arr` before
-    returning so escaped references cannot silently mutate unpinned storage. Raises
-    `BufferError` if another view is already pinning the buffer on entry.
+    Deterministically unpins on exit when no external reference to the `ndarray` or any
+    derived slice/view escaped the `with` block. If an external view or slice remains
+    alive on exit, the native buffer stays safely pinned (preventing use-after-free on
+    subsequent `close()` or `resize()`); `arr.setflags(write=False)` is also applied on
+    the yielded array, and `strict=True` raises `BufferError` on escape.
     """
     np = _require_numpy()
     proxy = buf.writable()
     mv = memoryview(proxy)
     arr = np.frombuffer(mv, dtype=np.dtype(mv.format))
-    base_mv = arr.base if isinstance(arr.base, memoryview) else None
+    arr_wr = weakref.ref(arr)
+    mv_wr = weakref.ref(mv)
     try:
         yield arr
     finally:
         arr.setflags(write=False)
-        try:
-            mv.release()
-        finally:
-            if base_mv is not None:
-                try:
-                    base_mv.release()
-                except BufferError as exc:
-                    raise BufferError(
-                        "noxpy.numpy_adapter.writable_array: exported view still holds an active "
-                        "sub-buffer pin on exit"
-                    ) from exc
+        # Drop our own strong refs; if neither `arr` nor any derived view/slice escaped,
+        # `arr_wr()` and `mv_wr()` immediately become None (releasing the PEP 3118 pin).
+        # If any view or slice escaped, `mv` stays alive & pinned, preventing UAF on close/resize.
+        del arr
+        del mv
+        del proxy
+        escaped = (arr_wr() is not None) or (mv_wr() is not None)
+        if strict and escaped:
+            raise BufferError(
+                "noxpy.numpy_adapter.writable_array: view or slice escaped context manager; "
+                "buffer remains pinned until all views are released"
+            )
 
 
 def as_typed_input(arr: Any, *, allow_copy: bool = False) -> Any:

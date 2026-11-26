@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import struct
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -245,8 +246,128 @@ def _audit_linux(so_path: Path, expected_symbol: str, loc: DiagnosticLocation) -
     return exports, py_c_syms, deps
 
 
+def _pe_rva_to_offset(sections: list[tuple[int, int, int, int]], rva: int) -> int | None:
+    for vaddr, vsize, raw_ptr, raw_size in sections:
+        span = max(vsize, raw_size)
+        if vaddr <= rva < vaddr + span:
+            off = raw_ptr + (rva - vaddr)
+            return off if off >= 0 else None
+    return None
+
+
+def _pe_read_cstr(data: bytes, offset: int | None) -> str:
+    if offset is None or offset < 0 or offset >= len(data):
+        return ""
+    end = data.find(b"\x00", offset)
+    if end < 0:
+        end = len(data)
+    return data[offset:end].decode("utf-8", errors="replace")
+
+
+def _audit_windows(pyd_path: Path, expected_symbol: str, loc: DiagnosticLocation) -> tuple[list[str], list[str], list[str]]:
+    data = pyd_path.read_bytes()
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise NoxPyError("NPY-E-ABI", f"Invalid PE binary (missing MZ header): {pyd_path}", location=loc)
+    pe_off = struct.unpack_from("<I", data, 0x3C)[0]
+    if pe_off + 24 > len(data) or data[pe_off : pe_off + 4] != b"PE\x00\x00":
+        raise NoxPyError("NPY-E-ABI", f"Invalid PE signature in {pyd_path}", location=loc)
+
+    _machine, num_sections, _ts, _sym_ptr, _num_syms, opt_size, _chars = struct.unpack_from("<HHIIIHH", data, pe_off + 4)
+    opt_off = pe_off + 24
+    if opt_off + opt_size > len(data) or opt_size < 112:
+        raise NoxPyError("NPY-E-ABI", f"Truncated PE optional header in {pyd_path}", location=loc)
+    magic = struct.unpack_from("<H", data, opt_off)[0]
+    if magic != 0x20B:
+        raise NoxPyError("NPY-E-ABI", f"Expected PE32+ (64-bit, magic 0x20B), got 0x{magic:X}", location=loc)
+
+    num_rvas = struct.unpack_from("<I", data, opt_off + 108)[0]
+    dd_off = opt_off + 112
+    exp_rva, exp_size = struct.unpack_from("<II", data, dd_off) if num_rvas >= 1 else (0, 0)
+    imp_rva, imp_size = struct.unpack_from("<II", data, dd_off + 8) if num_rvas >= 2 else (0, 0)
+
+    sec_off = opt_off + opt_size
+    sections: list[tuple[int, int, int, int]] = []
+    for i in range(num_sections):
+        entry = sec_off + i * 40
+        if entry + 40 > len(data):
+            break
+        vsize, vaddr, raw_size, raw_ptr = struct.unpack_from("<IIII", data, entry + 8)
+        sections.append((vaddr, vsize, raw_ptr, raw_size))
+
+    exports: list[str] = []
+    if exp_rva and exp_size:
+        eo = _pe_rva_to_offset(sections, exp_rva)
+        if eo is not None and eo + 40 <= len(data):
+            _num_funcs, num_names = struct.unpack_from("<II", data, eo + 20)
+            names_rva = struct.unpack_from("<I", data, eo + 32)[0]
+            names_off = _pe_rva_to_offset(sections, names_rva)
+            if names_off is not None:
+                for i in range(num_names):
+                    if names_off + (i + 1) * 4 > len(data):
+                        break
+                    nrva = struct.unpack_from("<I", data, names_off + i * 4)[0]
+                    name = _pe_read_cstr(data, _pe_rva_to_offset(sections, nrva))
+                    if name:
+                        exports.append(name)
+
+    deps: list[str] = []
+    py_c_syms: list[str] = []
+    bad_py_dlls: list[str] = []
+    if imp_rva and imp_size:
+        ioff = _pe_rva_to_offset(sections, imp_rva)
+        while ioff is not None and ioff + 20 <= len(data):
+            orig_ft, _ts2, _fwd, name_rva, ft = struct.unpack_from("<IIIII", data, ioff)
+            if orig_ft == 0 and name_rva == 0 and ft == 0:
+                break
+            dll_name = _pe_read_cstr(data, _pe_rva_to_offset(sections, name_rva))
+            if dll_name:
+                deps.append(dll_name)
+                low_dll = dll_name.lower()
+                if "nox" in low_dll:
+                    raise NoxPyError(
+                        "NPY-E-ABI",
+                        f"Unexpected external Nox DLL dependency: {dll_name}",
+                        location=loc,
+                    )
+                is_py_dll = low_dll.startswith("python") and low_dll.endswith(".dll")
+                if is_py_dll and low_dll != "python3.dll":
+                    bad_py_dlls.append(dll_name)
+
+                thunk_rva = orig_ft if orig_ft else ft
+                toff = _pe_rva_to_offset(sections, thunk_rva)
+                while toff is not None and toff + 8 <= len(data):
+                    entry_val = struct.unpack_from("<Q", data, toff)[0]
+                    if entry_val == 0:
+                        break
+                    if (entry_val & (1 << 63)) == 0:
+                        hint_name_rva = entry_val & 0x7FFFFFFF
+                        h_off = _pe_rva_to_offset(sections, hint_name_rva)
+                        if h_off is not None and h_off + 2 < len(data):
+                            sym_name = _pe_read_cstr(data, h_off + 2)
+                            if sym_name.startswith("Py") or sym_name.startswith("_Py"):
+                                py_c_syms.append(sym_name)
+                    toff += 8
+            ioff += 20
+
+    if bad_py_dlls:
+        raise NoxPyError(
+            "NPY-E-ABI",
+            f"Windows abi3t extension must link python3.dll (stable ABI), not version-specific {bad_py_dlls}",
+            location=loc,
+        )
+
+    expected_c = expected_symbol[1:] if expected_symbol.startswith("_PyModExport_") else expected_symbol
+    if exports != [expected_c]:
+        raise NoxPyError(
+            "NPY-E-ABI",
+            f"Exported symbols mismatch: expected [{expected_c}], got {exports}",
+            location=loc,
+        )
+    return exports, py_c_syms, deps
+
+
 def audit_extension_binary(so_path: str | Path, expected_export_symbol: str) -> AuditResult:
-    """Audit a compiled `.abi3t.so` extension against NoxPy §5/§6 ABI & closure contracts."""
+    """Audit a compiled `.abi3t.so` / `.pyd` extension against NoxPy §5/§6 ABI & closure contracts."""
     path = Path(so_path)
     loc = DiagnosticLocation(file=str(path))
     if not path.is_file():
@@ -258,6 +379,8 @@ def audit_extension_binary(so_path: str | Path, expected_export_symbol: str) -> 
         exports, py_c_syms, deps = _audit_darwin(path, expected_export_symbol, loc)
     elif sys.platform.startswith("linux"):
         exports, py_c_syms, deps = _audit_linux(path, expected_export_symbol, loc)
+    elif sys.platform == "win32":
+        exports, py_c_syms, deps = _audit_windows(path, expected_export_symbol, loc)
     else:
         raise NoxPyError("NPY-E-ABI", f"Unsupported platform for binary audit: {sys.platform}", location=loc)
 

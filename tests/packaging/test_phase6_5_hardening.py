@@ -241,11 +241,11 @@ print(f"P65_HARDENING_OK gil={sys._is_gil_enabled()} plain_list_100k_ms={elapsed
                 self.assertIn("P65_HARDENING_OK", run.stdout)
 
     def test_real_numpy_and_pyarrow_interop(self) -> None:
-        if UV is None or NOXC is None:
+        if UV is None or NOXC is None or PY315T is None:
             if REQUIRE_NATIVE:
-                self.fail("NOXPY_REQUIRE_NATIVE=1 set, but uv or noxc missing")
-            self.skipTest("requires uv and noxc")
-        assert UV is not None
+                self.fail(f"NOXPY_REQUIRE_NATIVE=1 set, but missing toolchain (NOXC={NOXC}, UV={UV}, PY315T={PY315T})")
+            self.skipTest("requires uv, noxc, and python3.15t")
+        assert UV is not None and PY315T is not None
 
         with tempfile.TemporaryDirectory(prefix="noxpy-p65-np-pa-") as td:
             tmp = Path(td)
@@ -253,27 +253,17 @@ print(f"P65_HARDENING_OK gil={sys._is_gil_enabled()} plain_list_100k_ms={elapsed
             shutil.copytree(ROOT / "examples" / "atlas", at_proj)
             at_res = build_project_wheel(at_proj, tmp / "dist", release=True, use_cache=False)
 
-            venv_dir = tmp / "venv-np-pa"
-            subprocess.run([UV, "venv", "--python", sys.executable, str(venv_dir)], check=True)
-            vpy = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-            inst = subprocess.run(
-                [UV, "pip", "install", "--python", str(vpy), "--only-binary", ":all:", str(at_res.wheel_path), "numpy", "pyarrow"],
-                capture_output=True,
-                text=True,
-            )
-            if inst.returncode != 0:
-                if REQUIRE_NATIVE:
-                    self.fail(f"Failed to install binary numpy/pyarrow on Python {sys.version}: {inst.stderr}")
-                self.skipTest(f"numpy/pyarrow binary wheels unavailable on {sys.version.split()[0]}: {inst.stderr.strip()}")
-
-            np_pa_script = r"""
+            np_script = r"""
 import gc
 import sys
 import numpy as np
-import pyarrow as pa
 import atlas_demo as ad
-from noxpy.numpy_adapter import as_ndarray, writable_array, as_typed_input
-from noxpy.arrow_adapter import export_arrow_array, import_arrow_array, export_arrow_stream
+from noxpy.numpy_adapter import as_ndarray, as_writable_ndarray, writable_array, as_typed_input
+from noxpy.arrow_adapter import export_arrow_array, import_arrow_array, export_arrow_stream, import_arrow_stream
+
+expect_gil = sys.argv[1] == "1"
+has_pyarrow = sys.argv[2] == "1"
+assert sys._is_gil_enabled() is expect_gil
 
 col = ad.make_f64_column(6)  # [0, 1, 2, 3, 4, 5]
 
@@ -286,68 +276,161 @@ del ro
 gc.collect()
 assert col.is_pinned is False
 
-# 2. Real NumPy writable_array deterministic unpin + post-exit read-only guard
-with writable_array(col) as warr:
-    warr[:] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float64)
-assert ad.neumaier_sum_buf(col) == 210.0
-# Deterministic unpin even while `warr` remains in locals, and writes blocked on escaped ref!
+# 2a. Real NumPy writable_array non-escaped deterministic unpin
+def _write_scoped(buf):
+    with writable_array(buf) as w:
+        w[:] = np.array([10.0, 20.0, 30.0, 40.0, 50.0, 60.0], dtype=np.float64)
+
+_write_scoped(col)
 assert col.is_pinned is False
+assert ad.neumaier_sum_buf(col) == 210.0
+
+# 2b. UAF prevention: if `warr` or a derived slice `sub` escapes, buffer stays safely pinned!
+with writable_array(col) as warr:
+    sub = warr[1:4]
+assert col.is_pinned is True
 try:
     warr[0] = 999.0
     raise AssertionError("expected ValueError writing to escaped writable_array ndarray after exit")
 except ValueError:
     pass
+for op in (lambda: col.close(), lambda: ad.resize_buf(col, 2)):
+    try:
+        op()
+        raise AssertionError("expected BufferError/RuntimeError while escaped NumPy view/slice still alive")
+    except (BufferError, RuntimeError):
+        pass
+del warr, sub
+gc.collect()
+assert col.is_pinned is False
 assert ad.neumaier_sum_buf(col) == 210.0
+
+# 2c. strict=True raises BufferError on escape while keeping buffer safely pinned
+try:
+    with writable_array(col, strict=True) as escaped_strict:
+        pass
+    raise AssertionError("expected BufferError from strict=True on escaped view")
+except BufferError:
+    pass
+assert col.is_pinned is True
+del escaped_strict
+gc.collect()
+assert col.is_pinned is False
+
+# 2d. as_writable_ndarray GC-scoped exclusive mutable view
+wn = as_writable_ndarray(col)
+wn[0] = 15.0
+assert col.is_pinned is True
+del wn
+gc.collect()
+assert col.is_pinned is False
+assert ad.neumaier_sum_buf(col) == 215.0
 
 # 3. Bulk TYPED_ARRAY with real NumPy array
 np_vec = np.linspace(1.0, 100.0, 100, dtype=np.float64)
 assert abs(ad.neumaier_sum_bulk(as_typed_input(np_vec)) - 5050.0) < 1e-9
 
-# 4. Real PyArrow <- Nox F64Buffer zero-copy via Arrow PyCapsule Interface
-exp = export_arrow_array(col, name="metric")
-pa_arr = pa.array(exp)
-assert pa_arr.to_pylist() == [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
-assert pa_arr.buffers()[1].address == as_ndarray(col).__array_interface__["data"][0]
-gc.collect()
-assert col.is_pinned is True
-del pa_arr
-gc.collect()
-assert col.is_pinned is False
-
-# 5. NoxPy Arrow import <- real PyArrow array & sliced array (non-zero offset!)
-pa_src = pa.array([1.25, 2.5, 3.75, 5.0, 6.25], type=pa.float64())
-pa_sliced = pa_src.slice(2, 3)  # offset=2, length=3 => [3.75, 5.0, 6.25]
-with import_arrow_array(pa_sliced) as imp:
-    assert imp.offset == 2 and imp.length == 3
-    with memoryview(imp) as imv:
-        assert list(imv) == [3.75, 5.0, 6.25]
-
-# 6. Real PyArrow RecordBatchReader / Array stream interop
+# 4. Arrow C Data & C Stream zero-copy (real PyArrow when supported by host Python, plus native PyCapsule round-trip)
 b1 = ad.make_f64_column(2)
 b2 = ad.make_f64_column(3)
-stream_exp = export_arrow_stream([b1, b2], name="vals")
-pa_stream = pa.chunked_array if False else None
-del pa_stream
-# Verify PyCapsule stream protocol works directly with pyarrow.lib.ChunkedArray or RecordBatch if supported;
-# and verify stream chunks round-trip through pa.RecordBatchReader if schema matches or import_arrow_stream:
+pa_ver = "upstream-import-crash"
 try:
-    reader = pa.ipc.RecordBatchStreamReader if False else None
-    arr_from_cap = import_arrow_array(export_arrow_array(b1))
-    with arr_from_cap:
-        with memoryview(arr_from_cap) as cmv:
-            assert list(cmv) == [0.0, 1.0]
+    if has_pyarrow:
+        import pyarrow as pa
+        pa_ver = pa.__version__
+        exp = export_arrow_array(col, name="metric")
+        pa_arr = pa.array(exp)
+        assert pa_arr.to_pylist() == [15.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+        assert pa_arr.buffers()[1].address == as_ndarray(col).__array_interface__["data"][0]
+        gc.collect()
+        assert col.is_pinned is True
+        del pa_arr
+        gc.collect()
+        assert col.is_pinned is False
+
+        pa_src = pa.array([1.25, 2.5, 3.75, 5.0, 6.25], type=pa.float64())
+        pa_sliced = pa_src.slice(2, 3)  # offset=2, length=3 => [3.75, 5.0, 6.25]
+        with import_arrow_array(pa_sliced) as imp:
+            assert imp.offset == 2 and imp.length == 3
+            with memoryview(imp) as imv:
+                assert list(imv) == [3.75, 5.0, 6.25]
+
+        stream_exp = export_arrow_stream([b1, b2], name="vals")
+        pa_chunked = pa.chunked_array(stream_exp)
+        assert pa_chunked.num_chunks == 2
+        assert pa_chunked.to_pylist() == [0.0, 1.0, 0.0, 1.0, 2.0]
+        assert b1.is_pinned is True and b2.is_pinned is True
+        del pa_chunked, stream_exp
+        gc.collect()
+        assert b1.is_pinned is False and b2.is_pinned is False
+
+        pa_in_chunked = pa.chunked_array([[1.5, 2.5], [3.5, 4.5, 5.5]], type=pa.float64())
+        chunks = import_arrow_stream(pa_in_chunked)
+        assert len(chunks) == 2
+        total_stream = 0.0
+        for ch in chunks:
+            with ch:
+                with memoryview(ch) as cmv:
+                    total_stream += ad.neumaier_sum_bulk(cmv)
+        assert total_stream == 17.5
+    else:
+        with import_arrow_array(export_arrow_array(col, name="metric")) as imp:
+            with memoryview(imp) as imv:
+                assert list(imv) == [15.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+        assert col.is_pinned is False
+        chunks = import_arrow_stream(export_arrow_stream([b1, b2], name="vals"))
+        assert len(chunks) == 2
+        total_stream = 0.0
+        for ch in chunks:
+            with ch:
+                with memoryview(ch) as cmv:
+                    total_stream += ad.neumaier_sum_bulk(cmv)
+        assert total_stream == 4.0
+        assert b1.is_pinned is False and b2.is_pinned is False
 finally:
     b1.close()
     b2.close()
 col.close()
-print(f"REAL_NUMPY_PYARROW_OK numpy={np.__version__} pyarrow={pa.__version__}")
+assert sys._is_gil_enabled() is expect_gil
+print(f"REAL_NUMPY_PYARROW_OK gil={sys._is_gil_enabled()} numpy={np.__version__} pyarrow={pa_ver}")
 """
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(ROOT / "python")
-            run = subprocess.run([str(vpy), "-c", np_pa_script], env=env, capture_output=True, text=True)
-            if run.returncode != 0:
-                self.fail(f"Real NumPy/PyArrow test failed:\nstdout:\n{run.stdout}\nstderr:\n{run.stderr}")
-            self.assertIn("REAL_NUMPY_PYARROW_OK", run.stdout)
+            for label, py_exe, expect_gil in (
+                ("3.15", sys.executable, "1"),
+                ("3.15t", PY315T, "0"),
+            ):
+                venv_dir = tmp / f"venv-np-pa-{label}"
+                subprocess.run([UV, "venv", "--python", py_exe, str(venv_dir)], check=True)
+                vpy = venv_dir / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+                inst = subprocess.run(
+                    [UV, "pip", "install", "--python", str(vpy), "--only-binary", ":all:", str(at_res.wheel_path), "numpy", "pyarrow"],
+                    capture_output=True,
+                    text=True,
+                )
+                if inst.returncode != 0:
+                    if REQUIRE_NATIVE:
+                        self.fail(f"Failed to install binary numpy/pyarrow on {label} ({py_exe}): {inst.stderr}")
+                    self.skipTest(f"numpy/pyarrow binary wheels unavailable on {label}: {inst.stderr.strip()}")
+
+                pa_probe = subprocess.run(
+                    [str(vpy), "-c", "import pyarrow as pa; assert pa.array([1.0]).to_pylist() == [1.0]"],
+                    capture_output=True,
+                    text=True,
+                )
+                if label == "3.15" and pa_probe.returncode != 0:
+                    self.fail(f"PyArrow failed on standard 3.15 (rc={pa_probe.returncode}): {pa_probe.stderr}")
+                has_pyarrow = "1" if pa_probe.returncode == 0 else "0"
+
+                env = os.environ.copy()
+                env["PYTHONPATH"] = str(ROOT / "python")
+                run = subprocess.run(
+                    [str(vpy), "-c", np_script, expect_gil, has_pyarrow],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                if run.returncode != 0:
+                    self.fail(f"Real NumPy/PyArrow test failed on {label}:\nstdout:\n{run.stdout}\nstderr:\n{run.stderr}")
+                self.assertIn("REAL_NUMPY_PYARROW_OK", run.stdout)
 
 
 if __name__ == "__main__":

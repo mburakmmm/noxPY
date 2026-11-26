@@ -30,7 +30,8 @@ Two constraints govern the design:
 - Top-level Nox functions and `@export class` methods that construct and return `nox.host.*Buffer` handles allocate into a `NoxHostContext` stored inside a `NoxPySharedCtx` refcounted holder (`noxpy_buf_new_from_shared_handle`) rather than releasing the context back to the module pool while the handle is alive. The shared context is destroyed only when the last referencing Python buffer handle closes or is garbage-collected.
 
 ### 4. Optional NumPy Integration Without Core ABI Pollution
-- [`python/noxpy/numpy_adapter.py`](../../python/noxpy/numpy_adapter.py) provides `as_typed_input(obj)`, `from_buffer(buf, copy=False)`, and `writable_array(buf)` on top of standard PEP 3118 `memoryview` / `np.asarray`.
+- [`python/noxpy/numpy_adapter.py`](../../python/noxpy/numpy_adapter.py) provides `as_typed_input(obj)`, `as_ndarray(buf)`, `as_writable_ndarray(buf)`, and `writable_array(buf, strict=False)` on top of standard PEP 3118 `memoryview` / `np.asarray`.
+- **UAF-free `writable_array` escape guard:** Because `np.frombuffer(mv)` stores `mv` as `arr.base` without a PEP 3118 sub-export lock, `writable_array()` checks both `arr` and `mv` reference counts on exit after revoking `arr.setflags(write=False)`. Deterministic `mv.release()` runs **only** when neither `arr` nor any derived slice/view escaped; if a view or slice escaped, the native buffer remains safely pinned until all views are garbage-collected (`strict=True` raises `BufferError` while still preserving the pin). Callers wanting an explicit GC-scoped mutable array use `as_writable_ndarray(buf)`.
 - Core `.abi3t.so` binaries have zero compile-time or link-time NumPy dependency (`import numpy` is lazy and optional), preserving dual `3.15` / `3.15t` compatibility and `Py_MOD_GIL_NOT_USED`.
 
 ### 5. Addendum (Phase 6 — Arrow C Data & C Stream PyCapsule Ownership)

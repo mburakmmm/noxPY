@@ -155,11 +155,32 @@ def _strip_default_literal(raw_default: str) -> str | None:
     return None
 
 
+_SKIP_SCAN_DIRS = frozenset(
+    {
+        ".git",
+        ".noxpy-cache",
+        "tests",
+        "examples",
+        "benchmarks",
+        "docs",
+        "scripts",
+        "build",
+        "dist",
+        "project",
+    }
+)
+
+_SUPPORTED_DUNDERS = frozenset(
+    {"__repr__", "__str__", "__eq__", "__len__", "__iter__", "__next__", "__enter__", "__exit__"}
+)
+
+
 @dataclass(frozen=True)
 class _ParsedParam:
     name: str
     type_name: str
     default_literal: str | None
+    kind: str = "positional_or_keyword"
 
 
 @dataclass(frozen=True)
@@ -173,38 +194,109 @@ class _ParsedFunc:
     reason: str | None
 
 
-def _discover_module_files(pkg_root: Path, entry_rel: str, only_modules: list[str] | None) -> list[Path]:
-    all_nox = sorted(
-        p
-        for p in pkg_root.iterdir()
-        if p.is_file()
-        and p.suffix == ".nox"
-        and not p.name.startswith("_")
-        and not p.name.endswith("_test.nox")
-    )
+@dataclass(frozen=True)
+class _ParsedMethod:
+    name: str
+    method_kind: str  # constructor | instance | staticmethod | classmethod | property_get | dunder
+    params: tuple[_ParsedParam, ...]
+    return_type: str
+    is_async: bool
+
+
+@dataclass(frozen=True)
+class _ParsedClass:
+    module: str
+    name: str
+    is_generic: bool
+    is_exception: bool
+    constructor: _ParsedMethod | None
+    methods: tuple[_ParsedMethod, ...]
+    reason: str | None
+
+
+def _discover_module_files(
+    pkg_root: Path, entry_rel: str, only_modules: list[str] | None
+) -> list[tuple[str, Path]]:
+    discovered: dict[str, Path] = {}
+    entry_norm = Path(entry_rel).as_posix()
+
+    def _walk(base: Path) -> None:
+        if not base.is_dir():
+            return
+        for p in sorted(base.rglob("*.nox")):
+            rel_parts = p.relative_to(base).parts
+            if any(part.startswith("_") or part in _SKIP_SCAN_DIRS for part in rel_parts):
+                continue
+            if p.name.endswith("_test.nox"):
+                continue
+            if p.relative_to(pkg_root).as_posix() == entry_norm and len(rel_parts) == 1:
+                continue
+            mod_dotted = ".".join(p.relative_to(base).with_suffix("").parts)
+            discovered.setdefault(mod_dotted, p)
+
+    _walk(pkg_root)
     src_dir = pkg_root / "src"
     if src_dir.is_dir():
-        all_nox.extend(
-            sorted(
-                p
-                for p in src_dir.iterdir()
-                if p.is_file()
-                and p.suffix == ".nox"
-                and not p.name.startswith("_")
-                and not p.name.endswith("_test.nox")
-            )
-        )
-    if len(all_nox) > 1:
-        all_nox = [p for p in all_nox if p.name != entry_rel]
+        _walk(src_dir)
+
+    if len(discovered) > 1:
+        entry_stem = Path(entry_rel).stem
+        if entry_stem in discovered and Path(entry_rel).name == entry_rel:
+            discovered.pop(entry_stem, None)
+
+    items = sorted(discovered.items(), key=lambda kv: kv[0])
     if only_modules is not None:
         wanted = {m.strip() for m in only_modules if m.strip()}
-        all_nox = [p for p in all_nox if p.stem in wanted]
-    return all_nox
+        items = [(m, p) for m, p in items if m in wanted]
+    return items
 
 
-def _scan_module(mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str], list[str], list[str]]:
+def _parse_params_list(params_str: str, *, allow_self: bool = False) -> tuple[list[_ParsedParam], str | None]:
+    if not params_str.strip():
+        return [], None
+    raw_items = _split_top_level(params_str, ",")
+    has_slash = "/" in raw_items
+    cur_kind = "positional_only" if has_slash else "positional_or_keyword"
+    parsed: list[_ParsedParam] = []
+    seen_self = False
+
+    for p_item in raw_items:
+        if p_item == "/":
+            cur_kind = "positional_or_keyword"
+            continue
+        if p_item == "*":
+            cur_kind = "keyword_only"
+            continue
+        if p_item.startswith("*"):
+            return [], f"varargs/kwargs parameter {p_item!r} not supported"
+        eq_parts = _split_top_level(p_item, "=")
+        decl = eq_parts[0].strip()
+        def_lit = _strip_default_literal(eq_parts[1]) if len(eq_parts) == 2 else None
+        if len(eq_parts) > 2 or (len(eq_parts) == 2 and def_lit is None):
+            return [], f"non-literal default on parameter {decl!r}"
+
+        if allow_self and not seen_self and decl in ("self", "cls"):
+            seen_self = True
+            continue
+        if ":" not in decl:
+            return [], f"unannotated parameter {decl!r}"
+        pname, ptype = decl.split(":", 1)
+        pname = pname.strip()
+        ptype = " ".join(ptype.strip().split())
+        if allow_self and not seen_self and pname in ("self", "cls"):
+            seen_self = True
+            continue
+        if not IDENT_RE.match(pname):
+            return [], f"invalid parameter name {pname!r}"
+        ok_t, r_t = _is_supported_abi_type(ptype, for_return=False)
+        if not ok_t:
+            return [], f"param '{pname}': {r_t}"
+        parsed.append(_ParsedParam(name=pname, type_name=ptype, default_literal=def_lit, kind=cur_kind))
+    return parsed, None
+
+
+def _scan_module(mod_name: str, mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str], list[_ParsedClass]]:
     text = mod_path.read_text(encoding="utf-8")
-    mod_name = mod_path.stem
 
     all_match = _ALL_RE.search(text)
     explicit_all: set[str] | None = None
@@ -215,8 +307,7 @@ def _scan_module(mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str
     unsafe_imports: list[str] = []
     intra_imports: list[str] = []
     funcs: list[_ParsedFunc] = []
-    generic_classes: list[str] = []
-    public_classes: list[str] = []
+    classes: list[_ParsedClass] = []
 
     lines = text.splitlines()
     i = 0
@@ -239,11 +330,115 @@ def _scan_module(mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str
             cls_m = _CLASS_RE.match(raw_line)
             if cls_m:
                 cname = cls_m.group(1)
-                if not cname.startswith("_") and (explicit_all is None or cname in explicit_all):
-                    if cls_m.group(2):
-                        generic_classes.append(f"{mod_name}.{cname}{cls_m.group(2)}")
+                is_gen_cls = bool(cls_m.group(2))
+                bases_str = (cls_m.group(3) or "").strip()
+                is_exc_cls = "Exception" in bases_str or "Error" in bases_str
+                # Collect indented class body
+                body_lines: list[str] = []
+                j = i + 1
+                while j < len(lines):
+                    bl = lines[j]
+                    if not bl.strip() or bl.lstrip().startswith("#") or bl[0].isspace():
+                        body_lines.append(bl)
+                        j += 1
                     else:
-                        public_classes.append(f"{mod_name}.{cname}")
+                        break
+                i = j - 1
+
+                if not cname.startswith("_") and (explicit_all is None or cname in explicit_all):
+                    if is_gen_cls:
+                        classes.append(
+                            _ParsedClass(
+                                module=mod_name,
+                                name=f"{cname}{cls_m.group(2)}",
+                                is_generic=True,
+                                is_exception=is_exc_cls,
+                                constructor=None,
+                                methods=(),
+                                reason="generic class requires specialization",
+                            )
+                        )
+                    elif is_exc_cls:
+                        classes.append(
+                            _ParsedClass(
+                                module=mod_name,
+                                name=cname,
+                                is_generic=False,
+                                is_exception=True,
+                                constructor=None,
+                                methods=(),
+                                reason="custom exception class requires UR-016.5 compiler support",
+                            )
+                        )
+                    else:
+                        ctor: _ParsedMethod | None = None
+                        methods: list[_ParsedMethod] = []
+                        cls_reason: str | None = None
+                        pending_dec: str | None = None
+                        k = 0
+                        while k < len(body_lines):
+                            bl_strip = body_lines[k].strip()
+                            if bl_strip in ("@property", "@staticmethod", "@classmethod"):
+                                pending_dec = bl_strip[1:]
+                                k += 1
+                                continue
+                            if bl_strip.startswith("def ") or bl_strip.startswith("async def "):
+                                msig = bl_strip
+                                pbal = msig.count("(") - msig.count(")")
+                                while pbal > 0 and k + 1 < len(body_lines):
+                                    k += 1
+                                    msig += " " + body_lines[k].strip()
+                                    pbal = msig.count("(") - msig.count(")")
+                                mm = _DEF_RE.match(msig)
+                                if mm:
+                                    mname = mm.group(1)
+                                    m_is_async = msig.startswith("async ")
+                                    m_is_gen = bool(mm.group(2))
+                                    mparams_s = mm.group(3).strip()
+                                    mret_s = (mm.group(4) or "None").strip()
+                                    if mname == "__init__":
+                                        mp, mr = _parse_params_list(mparams_s, allow_self=True)
+                                        if mr is None and not m_is_gen and not m_is_async:
+                                            ctor = _ParsedMethod("__init__", "constructor", tuple(mp), "None", False)
+                                        else:
+                                            cls_reason = mr or "unsupported __init__ signature"
+                                    elif (not mname.startswith("_") or mname in _SUPPORTED_DUNDERS) and not m_is_gen:
+                                        mkind = "instance"
+                                        if pending_dec == "property":
+                                            mkind = "property_get"
+                                        elif pending_dec == "staticmethod":
+                                            mkind = "staticmethod"
+                                        elif pending_dec == "classmethod":
+                                            mkind = "classmethod"
+                                        elif mname in _SUPPORTED_DUNDERS:
+                                            mkind = "dunder"
+                                        mp, mr = _parse_params_list(
+                                            mparams_s, allow_self=(mkind != "staticmethod")
+                                        )
+                                        ok_mr, r_mr = _is_supported_abi_type(mret_s, for_return=True)
+                                        if mr is None and ok_mr and mkind != "classmethod":
+                                            methods.append(
+                                                _ParsedMethod(mname, mkind, tuple(mp), mret_s, m_is_async)
+                                            )
+                                        elif mname == "__init__":
+                                            cls_reason = mr
+                                pending_dec = None
+                            elif bl_strip and not bl_strip.startswith("#"):
+                                pending_dec = None
+                            k += 1
+                        if cls_reason is None and ctor is None and not methods:
+                            cls_reason = "class has no exportable Host ABI constructor or methods"
+                        classes.append(
+                            _ParsedClass(
+                                module=mod_name,
+                                name=cname,
+                                is_generic=False,
+                                is_exception=False,
+                                constructor=ctor,
+                                methods=tuple(methods),
+                                reason=cls_reason,
+                            )
+                        )
                 i += 1
                 continue
 
@@ -269,33 +464,7 @@ def _scan_module(mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str
                         if is_generic:
                             bad_reason = "generic type parameters require explicit specialization"
                         elif params_str:
-                            for p_item in _split_top_level(params_str, ","):
-                                if p_item in ("/", "*"):
-                                    continue
-                                if p_item.startswith("*"):
-                                    bad_reason = f"varargs/kwargs parameter {p_item!r} not supported"
-                                    break
-                                # split top-level `=` first (outside brackets)
-                                eq_parts = _split_top_level(p_item, "=")
-                                decl = eq_parts[0]
-                                def_lit = _strip_default_literal(eq_parts[1]) if len(eq_parts) == 2 else None
-                                if len(eq_parts) > 2 or (len(eq_parts) == 2 and def_lit is None):
-                                    bad_reason = f"non-literal default on parameter {decl!r}"
-                                    break
-                                if ":" not in decl:
-                                    bad_reason = f"unannotated parameter {decl!r}"
-                                    break
-                                pname, ptype = decl.split(":", 1)
-                                pname = pname.strip()
-                                ptype = " ".join(ptype.strip().split())
-                                if not IDENT_RE.match(pname):
-                                    bad_reason = f"invalid parameter name {pname!r}"
-                                    break
-                                ok_t, r_t = _is_supported_abi_type(ptype, for_return=False)
-                                if not ok_t:
-                                    bad_reason = f"param '{pname}': {r_t}"
-                                    break
-                                parsed_params.append(_ParsedParam(name=pname, type_name=ptype, default_literal=def_lit))
+                            parsed_params, bad_reason = _parse_params_list(params_str, allow_self=False)
 
                         if bad_reason is None:
                             ok_r, r_r = _is_supported_abi_type(ret_str, for_return=True)
@@ -315,7 +484,16 @@ def _scan_module(mod_path: Path) -> tuple[list[_ParsedFunc], list[str], list[str
                         )
         i += 1
 
-    return funcs, unsafe_imports, intra_imports, generic_classes, public_classes
+    return funcs, unsafe_imports, intra_imports, classes
+
+
+def _detect_git_remote(pkg_root: Path) -> str | None:
+    if not (pkg_root / ".git").exists():
+        return None
+    res = subprocess.run(["git", "remote", "get-url", "origin"], cwd=pkg_root, capture_output=True, text=True)
+    if res.returncode == 0 and res.stdout.strip():
+        return res.stdout.strip()
+    return None
 
 
 def inspect_nox_package(pkg_dir: str | Path, *, modules: list[str] | None = None) -> dict[str, Any]:
@@ -339,30 +517,87 @@ def inspect_nox_package(pkg_dir: str | Path, *, modules: list[str] | None = None
 
     mod_files = _discover_module_files(root, entry_rel, modules)
     exportable: list[dict[str, Any]] = []
+    exportable_classes: list[dict[str, Any]] = []
     needs_spec: list[dict[str, Any]] = []
     unsupported: list[dict[str, Any]] = []
     unsafe_mods: dict[str, list[str]] = {}
     intra_mods: dict[str, list[str]] = {}
     scanned_names: list[str] = []
 
-    for mp in mod_files:
-        scanned_names.append(mp.stem)
-        funcs, u_imps, i_imps, g_cls, pub_cls = _scan_module(mp)
+    for mod_name, mp in mod_files:
+        scanned_names.append(mod_name)
+        funcs, u_imps, i_imps, classes = _scan_module(mod_name, mp)
         if u_imps:
-            unsafe_mods[mp.stem] = u_imps
+            unsafe_mods[mod_name] = u_imps
         if i_imps:
-            intra_mods[mp.stem] = i_imps
-        for gc_name in g_cls:
-            needs_spec.append({"module": mp.stem, "symbol": gc_name, "kind": "class", "reason": "generic class requires specialization"})
-        for pc_name in pub_cls:
-            unsupported.append({"module": mp.stem, "symbol": pc_name, "kind": "class", "reason": "non-annotated class requires explicit @export wrapper or phase-7 auto-class bridge"})
+            intra_mods[mod_name] = i_imps
+        for cls in classes:
+            if cls.is_generic:
+                needs_spec.append(
+                    {
+                        "module": cls.module,
+                        "symbol": f"{cls.module}.{cls.name}",
+                        "kind": "class",
+                        "reason": cls.reason,
+                    }
+                )
+            elif cls.reason is not None:
+                unsupported.append(
+                    {
+                        "module": cls.module,
+                        "symbol": f"{cls.module}.{cls.name}",
+                        "kind": "class",
+                        "reason": cls.reason,
+                    }
+                )
+            else:
+                exportable_classes.append(
+                    {
+                        "module": cls.module,
+                        "name": cls.name,
+                        "constructor": (
+                            {
+                                "params": [
+                                    {
+                                        "name": p.name,
+                                        "type": p.type_name,
+                                        "kind": p.kind,
+                                        "default": p.default_literal,
+                                    }
+                                    for p in cls.constructor.params
+                                ]
+                            }
+                            if cls.constructor
+                            else None
+                        ),
+                        "methods": [
+                            {
+                                "name": m.name,
+                                "method_kind": m.method_kind,
+                                "is_async": m.is_async,
+                                "params": [
+                                    {
+                                        "name": p.name,
+                                        "type": p.type_name,
+                                        "kind": p.kind,
+                                        "default": p.default_literal,
+                                    }
+                                    for p in m.params
+                                ],
+                                "return_type": m.return_type,
+                            }
+                            for m in cls.methods
+                        ],
+                    }
+                )
         for fn in funcs:
             entry_info = {
                 "module": fn.module,
                 "name": fn.name,
                 "is_async": fn.is_async,
                 "params": [
-                    {"name": p.name, "type": p.type_name, "default": p.default_literal} for p in fn.params
+                    {"name": p.name, "type": p.type_name, "kind": p.kind, "default": p.default_literal}
+                    for p in fn.params
                 ],
                 "return_type": fn.return_type,
             }
@@ -379,17 +614,21 @@ def inspect_nox_package(pkg_dir: str | Path, *, modules: list[str] | None = None
         "package": pkg_name,
         "version": pkg_version,
         "package_root": str(root),
+        "git_remote": _detect_git_remote(root),
+        "git_rev": _resolve_git_ref(root, None),
         "modules_scanned": scanned_names,
         "subinterpreter_safe": len(unsafe_mods) == 0,
         "subinterpreter_warnings": unsafe_mods,
         "intra_package_imports": intra_mods,
         "summary": {
             "exportable_count": len(exportable),
+            "exportable_class_count": len(exportable_classes),
             "needs_specialization_count": len(needs_spec),
             "unsupported_count": len(unsupported),
             "intra_package_import_modules": len(intra_mods),
         },
         "exportable": exportable,
+        "exportable_classes": exportable_classes,
         "needs_specialization": needs_spec,
         "unsupported": unsupported,
     }
@@ -405,6 +644,18 @@ def _resolve_git_ref(pkg_root: Path, override_ref: str | None) -> str:
     return "main"
 
 
+def _emit_param_sig_and_call(params: list[dict[str, Any]]) -> tuple[str, str]:
+    sig_parts: list[str] = []
+    call_parts: list[str] = []
+    for p in params:
+        decl = f"{p['name']}: {p['type']}"
+        if p["default"] is not None:
+            decl += f" = {p['default']}"
+        sig_parts.append(decl)
+        call_parts.append(p["name"])
+    return ", ".join(sig_parts), ", ".join(call_parts)
+
+
 def generate_package_wrapper(
     pkg_dir: str | Path,
     out_dir: str | Path,
@@ -413,6 +664,10 @@ def generate_package_wrapper(
     modules: list[str] | None = None,
     select: list[str] | None = None,
     git_ref: str | None = None,
+    repo_url: str | None = None,
+    portable: bool = False,
+    multi_module: bool = False,
+    include_classes: bool = True,
     fetch: bool = False,
 ) -> dict[str, Any]:
     """Generate a thin NoxPy wrapper extension project referencing an unmodified Nox package via `nox.json`."""
@@ -423,41 +678,71 @@ def generate_package_wrapper(
     if not IDENT_RE.match(pkg_alias) or pkg_alias == "nox":
         pkg_alias = f"pkg_{pkg_alias}"
 
-    mod_name = module_name or f"{pkg_alias}_py"
-    if not IDENT_RE.match(mod_name):
-        raise NoxPyError("NPY-E-CONFIG", f"Invalid generated Python module name: {mod_name!r}")
+    base_mod_name = module_name or f"{pkg_alias}_py"
+    if not IDENT_RE.match(base_mod_name):
+        raise NoxPyError("NPY-E-CONFIG", f"Invalid generated Python module name: {base_mod_name!r}")
 
     selected_set = {s.strip() for s in select if s.strip()} if select else None
-    chosen: list[dict[str, Any]] = []
+    chosen_fns: list[dict[str, Any]] = []
     seen_py_names: set[str] = set()
     for fn in report["exportable"]:
         fname = str(fn["name"])
         if selected_set is not None and fname not in selected_set and f"{fn['module']}.{fname}" not in selected_set:
             continue
-        py_name = fname if fname not in seen_py_names else f"{fn['module']}_{fname}"
+        py_name = fname if fname not in seen_py_names else f"{fn['module'].replace('.', '_')}_{fname}"
         seen_py_names.add(py_name)
-        chosen.append({**fn, "py_name": py_name})
+        chosen_fns.append({**fn, "py_name": py_name})
 
-    if not chosen:
+    chosen_classes: list[dict[str, Any]] = []
+    if include_classes:
+        for cls in report["exportable_classes"]:
+            cname = str(cls["name"])
+            if selected_set is not None and cname not in selected_set and f"{cls['module']}.{cname}" not in selected_set:
+                continue
+            py_name = cname if cname not in seen_py_names else f"{cls['module'].replace('.', '_')}_{cname}"
+            seen_py_names.add(py_name)
+            chosen_classes.append({**cls, "py_name": py_name})
+
+    if not chosen_fns and not chosen_classes:
         raise NoxPyError(
             "NPY-E-CONFIG",
-            f"No exportable Host ABI functions found in {pkg_name!r} matching filter",
+            f"No exportable Host ABI functions or classes found in {pkg_name!r} matching filter",
             hint="Inspect supported APIs with `noxpy check --compatibility <pkg_dir>`.",
         )
+
+    detected_remote = report.get("git_remote")
+    if repo_url:
+        dep_repo = repo_url
+        dep_portable = True
+    elif portable:
+        if not detected_remote:
+            raise NoxPyError(
+                "NPY-E-CONFIG",
+                f"--portable requested for {pkg_name!r}, but no git `origin` remote was found in {root}",
+                hint="Pass --repo-url <git-url> explicitly or configure git remote origin.",
+            )
+        dep_repo = str(detected_remote)
+        dep_portable = True
+    else:
+        dep_repo = str(root)
+        dep_portable = False
 
     out_root = Path(out_dir).resolve()
     (out_root / "src").mkdir(parents=True, exist_ok=True)
     ref = _resolve_git_ref(root, git_ref)
 
+    nox_mod_name = f"{base_mod_name}._native" if multi_module else base_mod_name
+    leaf_name = "_native" if multi_module else base_mod_name
+
     nox_json = {
-        "name": normalize_dist_name(f"{mod_name}_bridge"),
+        "name": normalize_dist_name(f"{leaf_name}_bridge"),
         "version": str(report["version"]),
         "source": "nox",
         "entry": "src/lib.nox",
         "requires": [
             {
                 "alias": pkg_alias,
-                "repo": str(root),
+                "repo": dep_repo,
                 "ref": ref,
                 "require_signed_commit": False,
             }
@@ -467,21 +752,25 @@ def generate_package_wrapper(
 
     dist_name = f"noxpy-{pkg_alias.replace('_', '-')}"
     py_ver = str(report["version"])
-    pyproject_txt = "\n".join(
+    toml_lines = [
+        "[build-system]",
+        'requires = ["noxpy>=0.1.0a1"]',
+        'build-backend = "noxpy.build"',
+        "",
+        "[project]",
+        f'name = "{dist_name}"',
+        f'version = "{py_ver}"',
+        f'description = "NoxPy native Python bindings for Nox package {pkg_name}"',
+        'requires-python = ">=3.15"',
+        "",
+        "[tool.noxpy]",
+        f'module-name = "{nox_mod_name}"',
+        'source = "src/lib.nox"',
+    ]
+    if multi_module:
+        toml_lines.append('python-source = "python"')
+    toml_lines.extend(
         [
-            "[build-system]",
-            'requires = ["noxpy>=0.1.0a1"]',
-            'build-backend = "noxpy.build"',
-            "",
-            "[project]",
-            f'name = "{dist_name}"',
-            f'version = "{py_ver}"',
-            f'description = "NoxPy native Python bindings for Nox package {pkg_name}"',
-            'requires-python = ">=3.15"',
-            "",
-            "[tool.noxpy]",
-            f'module-name = "{mod_name}"',
-            'source = "src/lib.nox"',
             'backend = "llvm"',
             'abi = "abi3t"',
             "free-threaded = true",
@@ -490,9 +779,9 @@ def generate_package_wrapper(
             "",
         ]
     )
-    (out_root / "pyproject.toml").write_text(pyproject_txt, encoding="utf-8")
+    (out_root / "pyproject.toml").write_text("\n".join(toml_lines), encoding="utf-8")
 
-    needed_mods = sorted({str(fn["module"]) for fn in chosen})
+    needed_mods = sorted({str(x["module"]) for x in [*chosen_fns, *chosen_classes]})
     lib_lines = [
         f"# Auto-generated by `noxpy init --from-nox-package` targeting unmodified `{pkg_name}` ({ref}).",
         "",
@@ -501,18 +790,45 @@ def generate_package_wrapper(
         lib_lines.append(f"import {pkg_alias}.{m}")
     lib_lines.append("")
 
-    for fn in chosen:
-        params = fn["params"]
-        p_sig_parts: list[str] = []
-        p_call_parts: list[str] = []
-        for p in params:
-            decl = f"{p['name']}: {p['type']}"
-            if p["default"] is not None:
-                decl += f" = {p['default']}"
-            p_sig_parts.append(decl)
-            p_call_parts.append(p["name"])
-        sig_str = ", ".join(p_sig_parts)
-        call_str = ", ".join(p_call_parts)
+    for cls in chosen_classes:
+        inner_fq = f"{pkg_alias}.{cls['module']}.{cls['name']}"
+        lib_lines.append('@export("instance_locked")')
+        lib_lines.append(f"class {cls['py_name']}:")
+        lib_lines.append(f"    _inner: {inner_fq}")
+        lib_lines.append("")
+        ctor = cls.get("constructor")
+        if ctor:
+            c_sig, c_call = _emit_param_sig_and_call(ctor["params"])
+            c_sig_full = f"self, {c_sig}" if c_sig else "self"
+            lib_lines.append(f"    def __init__({c_sig_full}) -> None:")
+            lib_lines.append(f"        self._inner = {inner_fq}({c_call})")
+            lib_lines.append("")
+        for m in cls.get("methods", []):
+            m_sig, m_call = _emit_param_sig_and_call(m["params"])
+            mkind = m["method_kind"]
+            ret_t = str(m["return_type"])
+            async_kw = "async " if m["is_async"] else ""
+            await_kw = "await " if m["is_async"] else ""
+            if mkind == "property_get":
+                lib_lines.append("    @property")
+                lib_lines.append(f"    def {m['name']}(self) -> {ret_t}:")
+                lib_lines.append(f"        return self._inner.{m['name']}")
+                lib_lines.append("")
+            elif mkind == "staticmethod":
+                lib_lines.append("    @staticmethod")
+                lib_lines.append(f"    {async_kw}def {m['name']}({m_sig}) -> {ret_t}:")
+                tcall = f"{await_kw}{inner_fq}.{m['name']}({m_call})"
+                lib_lines.append(f"        {tcall}" if ret_t == "None" else f"        return {tcall}")
+                lib_lines.append("")
+            else:
+                m_sig_full = f"self, {m_sig}" if m_sig else "self"
+                lib_lines.append(f"    {async_kw}def {m['name']}({m_sig_full}) -> {ret_t}:")
+                tcall = f"{await_kw}self._inner.{m['name']}({m_call})"
+                lib_lines.append(f"        {tcall}" if ret_t == "None" else f"        return {tcall}")
+                lib_lines.append("")
+
+    for fn in chosen_fns:
+        sig_str, call_str = _emit_param_sig_and_call(fn["params"])
         ret_t = str(fn["return_type"])
         async_kw = "async " if fn["is_async"] else ""
         await_kw = "await " if fn["is_async"] else ""
@@ -526,6 +842,48 @@ def generate_package_wrapper(
         lib_lines.append("")
 
     (out_root / "src" / "lib.nox").write_text("\n".join(lib_lines), encoding="utf-8")
+
+    generated_py_modules: list[str] = []
+    if multi_module:
+        py_pkg_dir = out_root / "python" / base_mod_name
+        py_pkg_dir.mkdir(parents=True, exist_ok=True)
+        by_mod: dict[str, list[tuple[str, str]]] = {}
+        for fn in chosen_fns:
+            by_mod.setdefault(str(fn["module"]), []).append((str(fn["name"]), str(fn["py_name"])))
+        for cls in chosen_classes:
+            by_mod.setdefault(str(cls["module"]), []).append((str(cls["name"]), str(cls["py_name"])))
+
+        init_lines = ['"""Auto-generated multi-module NoxPy package bindings."""', "", "from . import _native", ""]
+        top_children: set[str] = set()
+        for mod_dotted, items in sorted(by_mod.items()):
+            parts = mod_dotted.split(".")
+            top_children.add(parts[0])
+            sub_dir = py_pkg_dir
+            for p in parts[:-1]:
+                sub_dir = sub_dir / p
+                sub_dir.mkdir(parents=True, exist_ok=True)
+                sub_init = sub_dir / "__init__.py"
+                if not sub_init.exists():
+                    sub_init.write_text("", encoding="utf-8")
+            rel_dots = "." * len(parts)
+            mod_py = sub_dir / f"{parts[-1]}.py"
+            m_lines = [f"from {rel_dots} import _native", ""]
+            all_names: list[str] = []
+            for orig_name, native_name in items:
+                m_lines.append(f"{orig_name} = _native.{native_name}")
+                all_names.append(orig_name)
+            m_lines.append("")
+            m_lines.append(f"__all__ = {all_names!r}")
+            m_lines.append("")
+            mod_py.write_text("\n".join(m_lines), encoding="utf-8")
+            generated_py_modules.append(f"{base_mod_name}.{mod_dotted}")
+
+        for child in sorted(top_children):
+            init_lines.append(f"from . import {child}")
+        init_lines.append("")
+        init_lines.append(f"__all__ = {['_native', *sorted(top_children)]!r}")
+        init_lines.append("")
+        (py_pkg_dir / "__init__.py").write_text("\n".join(init_lines), encoding="utf-8")
 
     locked_commit: str | None = None
     if fetch:
@@ -546,8 +904,14 @@ def generate_package_wrapper(
         "status": "ok",
         "source_package": pkg_name,
         "wrapper_dir": str(out_root),
-        "module_name": mod_name,
+        "module_name": nox_mod_name,
         "distribution_name": dist_name,
-        "exported_functions": [fn["py_name"] for fn in chosen],
+        "dependency_repo": dep_repo,
+        "dependency_portable": dep_portable,
+        "detected_remote": detected_remote,
+        "multi_module": multi_module,
+        "python_modules": generated_py_modules,
+        "exported_functions": [fn["py_name"] for fn in chosen_fns],
+        "exported_classes": [cls["py_name"] for cls in chosen_classes],
         "locked_commit": locked_commit,
     }

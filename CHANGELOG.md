@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Fixed & Hardened (Phase 7A)
+- **NumPy `writable_array()` UAF prevention:** Guarded `writable_array(buf, *, strict=False)` with `weakref.ref` checks in [`python/noxpy/numpy_adapter.py`](python/noxpy/numpy_adapter.py) so escaped `ndarray`s or derived slices keep the native buffer safely pinned (preventing UAF on `close()`/`resize()`), and added GC-scoped `as_writable_ndarray(buf)`. Updated [`ADR-0008`](docs/adr/0008-buffers-numpy-ownership.md).
+- **Subinterpreter `atexit` shutdown barrier & strict attach:** Removed `PyGILState_Ensure()` fallback for subinterpreters (`interp_id > 0`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) and added a per-interpreter `atexit` shutdown barrier (`interp_alive`, `active_attaches`, `active_async_ops`) so `interp.close()` drains active workers cleanly before `PyInterpreterState` teardown. Verified in [`tests/stress/test_phase7a_soak.py`](tests/stress/test_phase7a_soak.py).
+- **Real `3.15` & `3.15t` NumPy/PyArrow C Stream interop:** Verified `numpy==2.5.5` on both `3.15` and `3.15t` and `pyarrow==26.0.1` (`pa.array`, sliced arrays, and `pa.chunked_array` C Stream round-trips) in [`tests/packaging/test_phase6_5_hardening.py`](tests/packaging/test_phase6_5_hardening.py).
+
+### Added (Phase 7A — `UR-016` Spec, Package Bindings v2, Windows `.pyd` & CI)
+- Added isolated upstream spec [`docs/upstream/ur016-universal-package-bindings.md`](docs/upstream/ur016-universal-package-bindings.md) and executable reproducer [`tests/reproducers/ur016_universal_package_bindings.sh`](tests/reproducers/ur016_universal_package_bindings.sh).
+- Upgraded [`python/noxpy/pkg_bridge.py`](python/noxpy/pkg_bridge.py) & [`python/noxpy/__main__.py`](python/noxpy/__main__.py) with `--portable`, `--repo-url`, `--git-ref`, `--multi-module`, nested module discovery, `/` & `*` parameter kind metadata, and automatic `@export class` wrappers for non-generic public classes.
+- Added pure-Python PE32+ auditor `_audit_windows` ([`python/noxpy/audit.py`](python/noxpy/audit.py), [`tests/unit/test_audit_pe.py`](tests/unit/test_audit_pe.py)), Windows `.pyd` compile/link + `NOXPY_PLATFORM_TAG` (`manylinux`) in [`python/noxpy/build.py`](python/noxpy/build.py), and upgraded [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (`windows-nox-native-e2e`, pinned upstream `noxen` E2E, Linux `manylinux` + full-runtime UBSan link, and soak suite).
+- Archived verification evidence in [`docs/evidence/phase7a-2026-11-26.md`](docs/evidence/phase7a-2026-11-26.md).
+
 ## [0.6.5a1] — 2026-11-26 (Phase 6.5 Alpha: P0/P1 Hardening, Real NumPy/PyArrow & Universal Nox Package Bindings)
 
 ### Fixed & Hardened (Phase 6.5-A)

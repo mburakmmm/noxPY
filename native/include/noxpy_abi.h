@@ -11,6 +11,7 @@
 #endif
 
 #include <Python.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -75,6 +76,10 @@ typedef struct NoxPyHostOps {
     NoxHostStatus (*value_dict_entry)(
         NoxHostContext *ctx, NoxHostValue v, size_t index, NoxHostValue *key_out, NoxHostValue *value_out);
     NoxHostStatus (*value_release)(NoxHostContext *ctx, NoxHostValue v);
+    /* ---- ABI v1/v2 handle operations (UR-006, Phase 3) ---- */
+    NoxHostStatus (*handle_retain)(NoxHostContext *ctx, NoxHostHandle h, NoxHostHandle *out);
+    NoxHostStatus (*handle_release)(NoxHostContext *ctx, NoxHostHandle h);
+    int32_t (*handle_is_valid)(NoxHostContext *ctx, NoxHostHandle h);
 } NoxPyHostOps;
 
 /*
@@ -220,6 +225,56 @@ PyObject *noxpy_host_value_to_py(
     const NoxPyHostOps *ops,
     NoxHostContext *ctx,
     NoxHostValue val);
+
+/*
+ * Phase 3 (0.3) Heap-Type Object Data & Thread-Policy Handle Runtime (`ADR-0005`).
+ */
+#define NOXPY_POLICY_PARALLEL 0u
+#define NOXPY_POLICY_INSTANCE_LOCKED 1u
+#define NOXPY_POLICY_THREAD_AFFINE 2u
+
+typedef struct NoxPyObjectData {
+    PyObject *owner_module;
+    const NoxPyHostOps *host_ops;
+    NoxHostContext *owner_ctx;
+    NoxHostHandle handle;
+    uint64_t type_tag;
+    uint64_t instance_gen;
+    uint64_t owner_tid;
+    uint8_t thread_policy;
+    uint8_t closed;
+    uint8_t initialized;
+    uint8_t lock_ready;
+    pthread_mutex_t lock;
+} NoxPyObjectData;
+
+uint64_t noxpy_current_tid(void);
+int noxpy_host_context_create_and_init(const NoxPyHostOps *ops, NoxHostContext **out_ctx);
+void noxpy_host_context_fini_and_destroy(const NoxPyHostOps *ops, NoxHostContext *ctx);
+
+int noxpy_obj_init(
+    NoxPyObjectData *data,
+    PyObject *owner_module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *owner_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy);
+int noxpy_obj_enter_call(
+    NoxPyObjectData *data,
+    uint64_t expected_type_tag,
+    NoxHostContext **out_ctx,
+    NoxHostHandle *out_handle);
+void noxpy_obj_leave_call(NoxPyObjectData *data);
+int noxpy_obj_is_closed(NoxPyObjectData *data);
+void noxpy_obj_close(NoxPyObjectData *data);
+
+int noxpy_obj_traverse(PyObject *self, visitproc visit, void *arg);
+int noxpy_obj_clear(PyObject *self);
+void noxpy_obj_dealloc(PyObject *self);
+PyObject *noxpy_obj_enter_cm(PyObject *self, PyObject *ignored);
+PyObject *noxpy_obj_exit_cm(PyObject *self, PyObject *const *args, Py_ssize_t nargs);
+PyObject *noxpy_obj_close_method(PyObject *self, PyObject *ignored);
 
 #ifdef __cplusplus
 }

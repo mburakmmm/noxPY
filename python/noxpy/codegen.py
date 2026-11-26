@@ -447,6 +447,9 @@ def generate_c_adapter(ir: ModuleIR) -> str:
         "    .value_item = nox_host_value_item,",
         "    .value_dict_entry = nox_host_value_dict_entry,",
         "    .value_release = nox_host_value_release,",
+        "    .handle_retain = nox_host_handle_retain,",
+        "    .handle_release = nox_host_handle_release,",
+        "    .handle_is_valid = nox_host_handle_is_valid,",
         "};",
         "",
     ]

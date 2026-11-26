@@ -45,6 +45,15 @@ Per [`AGENTS.md`](AGENTS.md) §2 and §6, NoxPy tracks all compiler/runtime requ
 
 ---
 
-## Future Phase Upstream Tracking (Non-Blocking for Phase 0/1/2 Tooling)
+## Phase 3–7 Complete Upstream Requirements (`nox_host.h` v3 One-Shot Freeze Plan)
 
-Future phases (`Phase 3+`: method/property metadata in `expand --json`, `Phase 4+`: reentrant host callbacks / `async` / subinterpreters, long-term recoverable OOM or custom allocator hooks via `NoxHostContextConfig.allocator`) will be tracked incrementally as new `UR-009+` requirements when their respective phases are entered. See `docs/apis/host-abi.md` for currently documented `v1` scope.
+> **Single-Pass Upstream Freeze Spec:** All remaining compiler & runtime primitives needed for NoxPy Phases 3–7 (`1.0`) are specified together in [`docs/upstream/nox-host-abi-v3-freeze-spec.md`](docs/upstream/nox-host-abi-v3-freeze-spec.md) (`NOX_HOST_ABI_VERSION = 3u`, append-only backward-compatible with v1/v2) so `nox-lang` can stabilize its Zig Host ABI once before self-hosting bootstrap.
+
+| ID | Batch | Unlocks Phase | Requirement | Status on `noxc 2.2.87` |
+|---|---|---|---|---|
+| `UR-009` | Batch E | **Phase 3 (`0.3`: Native Classes)** | `@export class` / methods / properties / static & classmethods / custom exceptions in `noxc expand --json` + `--host-abi`, `nox_host_handle_type_name`, `NOX_HOST_VALUE_HANDLE` ([`ur009_pyclass_metadata.sh`](tests/reproducers/ur009_pyclass_metadata.sh)) | **Open** (`NoxHostHandle` works for top-level `@export` fns; class metadata open) |
+| `UR-010` | Batch F | **Phase 4 (`0.4`: Callbacks & `PyObject`)** | `NoxHostExternalRef`, `NoxHostCallbackOps`, unlock-`ctx.lock`-around-callback reentrancy, `NOX_HOST_ERR_HOST_EXCEPTION` token preservation | **Open** |
+| `UR-011` | Batch F | **Phase 4 (`0.4`: Async Tasks)** | `@export async def` C start/cancel/take-result/release API (`NoxHostTask`), `NOX_HOST_ERR_CANCELLED`, recoverable scheduler deadlock | **Open** (`@pyiterator` needs only `UR-009`) |
+| `UR-012` | Batch G | **Phase 5 & 6 (`0.5/0.6`: Buffers, NumPy, Atlas, Arrow)** | Pinned zero-copy contiguous views (`nox_host_handle_pin_buffer` / `unpin`, `NOX_HOST_ERR_BUSY`) + bulk `NOX_HOST_VALUE_TYPED_ARRAY` (`NoxHostDType`) | **Open** |
+| `UR-013` | Batch G/H | **Phase 4/6/7 (`0.4/0.6/1.0`: Allocator, Subinterpreters, Windows P0)** | Wire `NoxHostContextConfig.allocator` (`NoxHostAllocator`), `nox_host_capabilities()`, subinterpreter global isolation, Windows COFF `.dll`/`.obj` `--host-abi` parity | **Open** |
+| `UR-014` | Batch H | **Phase 7 (`1.0`: Zig Bootstrap Freeze)** | Promote `include/nox_host.h` v3 to Stable (append-only) in `docs/apis/stability.md` + C11 `_Static_assert` ABI layout test + allow `b"..."` default literal in checker | **Open** |

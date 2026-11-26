@@ -1476,3 +1476,269 @@ PyObject *noxpy_host_value_to_py(
     }
     return hv_to_py_rec(ops, ctx, val, 0);
 }
+
+static _Atomic uint64_t g_noxpy_instance_gen = 1;
+
+uint64_t noxpy_current_tid(void) {
+#if defined(__APPLE__)
+    uint64_t tid = 0;
+    if (pthread_threadid_np(NULL, &tid) == 0 && tid != 0) {
+        return tid;
+    }
+#endif
+    return (uint64_t)(uintptr_t)pthread_self();
+}
+
+int noxpy_host_context_create_and_init(const NoxPyHostOps *ops, NoxHostContext **out_ctx) {
+    return create_and_init_context(ops, out_ctx);
+}
+
+void noxpy_host_context_fini_and_destroy(const NoxPyHostOps *ops, NoxHostContext *ctx) {
+    destroy_host_context(ops, ctx);
+}
+
+static uint64_t next_instance_gen(void) {
+    uint64_t g = atomic_fetch_add_explicit(&g_noxpy_instance_gen, 1, memory_order_relaxed);
+    if (g == 0) {
+        g = atomic_fetch_add_explicit(&g_noxpy_instance_gen, 1, memory_order_relaxed);
+    }
+    return g;
+}
+
+int noxpy_obj_init(
+    NoxPyObjectData *data,
+    PyObject *owner_module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *owner_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy) {
+    if (!data || !owner_module || !ops || !owner_ctx || handle == 0) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_init");
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    if (pthread_mutex_init(&data->lock, NULL) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: failed to initialize instance mutex");
+        return -1;
+    }
+    data->lock_ready = 1u;
+    data->owner_module = Py_NewRef(owner_module);
+    data->host_ops = ops;
+    data->owner_ctx = owner_ctx;
+    data->handle = handle;
+    data->type_tag = type_tag;
+    data->instance_gen = next_instance_gen();
+    data->owner_tid = noxpy_current_tid();
+    data->thread_policy = thread_policy;
+    data->closed = 0u;
+    data->initialized = 1u;
+    return 0;
+}
+
+int noxpy_obj_enter_call(
+    NoxPyObjectData *data,
+    uint64_t expected_type_tag,
+    NoxHostContext **out_ctx,
+    NoxHostHandle *out_handle) {
+    if (!data || !out_ctx || !out_handle) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: null argument to noxpy_obj_enter_call");
+        return -1;
+    }
+    if (!data->initialized) {
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: native object is not initialized");
+        return -1;
+    }
+    if (expected_type_tag != 0 && data->type_tag != expected_type_tag) {
+        PyErr_SetString(PyExc_TypeError, "noxpy: native object type tag mismatch");
+        return -1;
+    }
+    if (data->thread_policy == NOXPY_POLICY_THREAD_AFFINE && noxpy_current_tid() != data->owner_tid) {
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: thread_affine instance accessed from foreign thread");
+        return -1;
+    }
+    if (!data->lock_ready) {
+        PyErr_SetString(PyExc_ValueError, "noxpy: operation on closed native object");
+        return -1;
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    pthread_mutex_lock(&data->lock);
+    Py_END_ALLOW_THREADS
+    if (data->closed || !data->owner_ctx || data->handle == 0 || !data->owner_module || !data->host_ops) {
+        pthread_mutex_unlock(&data->lock);
+        PyErr_SetString(PyExc_ValueError, "noxpy: operation on closed native object");
+        return -1;
+    }
+    if (data->host_ops->handle_is_valid &&
+        data->host_ops->handle_is_valid(data->owner_ctx, data->handle) == 0) {
+        pthread_mutex_unlock(&data->lock);
+        PyErr_SetString(PyExc_ValueError, "noxpy: invalid or released native handle");
+        return -1;
+    }
+    NoxPyModuleState *st = (NoxPyModuleState *)PyModule_GetState(data->owner_module);
+    if (!st || noxpy_module_lease_acquire(st) < 0) {
+        pthread_mutex_unlock(&data->lock);
+        return -1;
+    }
+    *out_ctx = data->owner_ctx;
+    *out_handle = data->handle;
+    return 0;
+}
+
+void noxpy_obj_leave_call(NoxPyObjectData *data) {
+    if (!data) {
+        return;
+    }
+    if (data->owner_module) {
+        NoxPyModuleState *st = (NoxPyModuleState *)PyModule_GetState(data->owner_module);
+        if (st) {
+            noxpy_module_lease_release(st);
+        }
+    }
+    if (data->lock_ready) {
+        pthread_mutex_unlock(&data->lock);
+    }
+}
+
+int noxpy_obj_is_closed(NoxPyObjectData *data) {
+    if (!data || !data->initialized) {
+        return 1;
+    }
+    if (!data->lock_ready) {
+        return 1;
+    }
+    int closed;
+    Py_BEGIN_ALLOW_THREADS
+    pthread_mutex_lock(&data->lock);
+    closed = (data->closed || !data->owner_ctx || data->handle == 0) ? 1 : 0;
+    pthread_mutex_unlock(&data->lock);
+    Py_END_ALLOW_THREADS
+    return closed;
+}
+
+static void obj_close_impl(NoxPyObjectData *data, int release_gil) {
+    if (!data) {
+        return;
+    }
+    PyObject *local_mod = NULL;
+    const NoxPyHostOps *local_ops = NULL;
+    NoxHostContext *local_ctx = NULL;
+    NoxHostHandle local_handle = 0;
+
+    if (data->lock_ready) {
+        if (release_gil) {
+            Py_BEGIN_ALLOW_THREADS
+            pthread_mutex_lock(&data->lock);
+            Py_END_ALLOW_THREADS
+        } else {
+            pthread_mutex_lock(&data->lock);
+        }
+    }
+    local_mod = data->owner_module;
+    local_ops = data->host_ops;
+    local_ctx = data->owner_ctx;
+    local_handle = data->handle;
+    data->closed = 1u;
+    data->owner_module = NULL;
+    data->host_ops = NULL;
+    data->owner_ctx = NULL;
+    data->handle = 0;
+    if (data->lock_ready) {
+        pthread_mutex_unlock(&data->lock);
+    }
+
+    /* Release native handle/context and drop PyObject ref STRICTLY outside locks (AGENTS.md §9/§10.4). */
+    if (release_gil) {
+        Py_BEGIN_ALLOW_THREADS
+        if (local_handle != 0 && local_ctx && local_ops && local_ops->handle_release) {
+            (void)local_ops->handle_release(local_ctx, local_handle);
+        }
+        if (local_ctx && local_ops) {
+            destroy_host_context(local_ops, local_ctx);
+        }
+        Py_END_ALLOW_THREADS
+    } else {
+        if (local_handle != 0 && local_ctx && local_ops && local_ops->handle_release) {
+            (void)local_ops->handle_release(local_ctx, local_handle);
+        }
+        if (local_ctx && local_ops) {
+            destroy_host_context(local_ops, local_ctx);
+        }
+    }
+    Py_XDECREF(local_mod);
+}
+
+void noxpy_obj_close(NoxPyObjectData *data) {
+    obj_close_impl(data, 0);
+}
+
+int noxpy_obj_traverse(PyObject *self, visitproc visit, void *arg) {
+    PyTypeObject *cls = Py_TYPE(self);
+    Py_VISIT(cls);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData_DuringGC(self, cls);
+    if (data && data->owner_module) {
+        Py_VISIT(data->owner_module);
+    }
+    return 0;
+}
+
+int noxpy_obj_clear(PyObject *self) {
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData_DuringGC(self, cls);
+    if (data) {
+        noxpy_obj_close(data);
+    }
+    return 0;
+}
+
+void noxpy_obj_dealloc(PyObject *self) {
+    PyObject_GC_UnTrack(self);
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(self, cls);
+    if (data) {
+        noxpy_obj_close(data);
+        if (data->lock_ready) {
+            pthread_mutex_destroy(&data->lock);
+            data->lock_ready = 0u;
+        }
+        data->initialized = 0u;
+    }
+    freefunc tp_free = (freefunc)PyType_GetSlot(cls, Py_tp_free);
+    if (tp_free) {
+        tp_free(self);
+    }
+    Py_DECREF(cls);
+}
+
+PyObject *noxpy_obj_enter_cm(PyObject *self, PyObject *ignored) {
+    (void)ignored;
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(self, cls);
+    if (noxpy_obj_is_closed(data)) {
+        PyErr_SetString(PyExc_ValueError, "noxpy: cannot enter context manager for closed native object");
+        return NULL;
+    }
+    return Py_NewRef(self);
+}
+
+PyObject *noxpy_obj_exit_cm(PyObject *self, PyObject *const *args, Py_ssize_t nargs) {
+    (void)args;
+    (void)nargs;
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(self, cls);
+    if (data) {
+        obj_close_impl(data, 1);
+    }
+    Py_RETURN_FALSE;
+}
+
+PyObject *noxpy_obj_close_method(PyObject *self, PyObject *ignored) {
+    (void)ignored;
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(self, cls);
+    if (data) {
+        obj_close_impl(data, 1);
+    }
+    Py_RETURN_NONE;
+}

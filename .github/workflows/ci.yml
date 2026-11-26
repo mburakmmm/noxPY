@@ -334,7 +334,7 @@ jobs:
             "-Wl,/EXPORT:PyModExport__noxpy_shim_test" `
             "-Wl,/NODEFAULTLIB:python3.lib" "-Wl,/NODEFAULTLIB:python315.lib" "-Wl,/NODEFAULTLIB:python315t.lib"
           if ($LASTEXITCODE -ne 0) { throw "Windows 3.15t .pyd clang/lld-link failed (exit $LASTEXITCODE)" }
-          & "${{ steps.py_ft.outputs.python-path }}" -c "from noxpy.audit import audit_extension_binary; r = audit_extension_binary(r'$pydFt', 'PyModExport__noxpy_shim_test'); print('PE_AUDIT_315T_OK', r.exports, r.dependencies)"
+          & "${{ steps.py_ft.outputs.python-path }}" -c "import sys; sys.path.insert(0, r'${{ github.workspace }}\python'); from noxpy.audit import audit_extension_binary; r = audit_extension_binary(r'$pydFt', 'PyModExport__noxpy_shim_test'); print('PE_AUDIT_315T_OK', r.exports, r.dependencies)"
           if ($LASTEXITCODE -ne 0) { throw "Windows 3.15t PE32+ audit failed (exit $LASTEXITCODE)" }
           $env:PYTHONPATH = $workFt
           & "${{ steps.py_ft.outputs.python-path }}" -c "import sys, _noxpy_shim_test as m; assert sys._is_gil_enabled() is False; assert m.rt_i64(42) == 42; assert m.rt_str('a\x00b') == 'a\x00b'; assert sys._is_gil_enabled() is False; print('WIN_315T_OK')"

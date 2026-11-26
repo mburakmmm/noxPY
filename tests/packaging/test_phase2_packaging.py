@@ -56,11 +56,16 @@ def _find_315t() -> str | None:
 NOXC = _find_noxc()
 UV = shutil.which("uv")
 PY315T = _find_315t()
+REQUIRE_NATIVE = os.environ.get("NOXPY_REQUIRE_NATIVE") == "1"
 
 
-@unittest.skipUnless(NOXC is not None and UV is not None, "requires noxc >= 2.2.78 and uv")
+@unittest.skipUnless(REQUIRE_NATIVE or (NOXC is not None and UV is not None), "requires noxc >= 2.2.78 and uv")
 class TestPhase2Packaging(unittest.TestCase):
     def test_mixed_package_wheel_cache_sdist_editable_and_dual_mode(self) -> None:
+        if NOXC is None or UV is None or PY315T is None:
+            if REQUIRE_NATIVE:
+                self.fail(f"NOXPY_REQUIRE_NATIVE=1 set, but missing toolchain (NOXC={NOXC}, UV={UV}, PY315T={PY315T})")
+            self.skipTest("requires noxc >= 2.2.86, uv, and python3.15t")
         assert UV is not None and PY315T is not None
         with tempfile.TemporaryDirectory(prefix="noxpy-p2-") as td:
             tmp = Path(td)

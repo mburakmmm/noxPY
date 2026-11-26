@@ -50,6 +50,7 @@ def _find_315t() -> str | None:
 NOXC = _find_noxc()
 UV = shutil.which("uv")
 PY315T = _find_315t()
+REQUIRE_NATIVE = os.environ.get("NOXPY_REQUIRE_NATIVE") == "1"
 
 
 def _verify_wheel_record_and_tags(whl_path: Path, expected_module: str, expected_stub: bool = True) -> None:
@@ -80,9 +81,11 @@ def _verify_wheel_record_and_tags(whl_path: Path, expected_module: str, expected
             assert int(size_s) == len(payload)
 
 
-@unittest.skipUnless(NOXC is not None and UV is not None, "requires noxc >= 2.2.78 and uv")
+@unittest.skipUnless(REQUIRE_NATIVE or (NOXC is not None and UV is not None), "requires noxc >= 2.2.78 and uv")
 class TestPhase1Wheels(unittest.TestCase):
     def test_examples_build_install_and_run_in_clean_dual_envs_without_compiler(self) -> None:
+        if NOXC is None or UV is None:
+            self.fail("NOXPY_REQUIRE_NATIVE=1 set, but noxc or uv is missing")
         assert UV is not None
         with tempfile.TemporaryDirectory(prefix="noxpy-p1-test-") as td:
             tmp = Path(td)

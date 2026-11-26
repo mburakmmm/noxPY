@@ -76,17 +76,27 @@ def evaluate_release_gate(root: Path, tag: str) -> dict[str, object]:
 
     if pypi_allowed:
         todo_p = root / "TODO.md"
-        if todo_p.is_file():
-            todo_txt = todo_p.read_text(encoding="utf-8")
-            sec_m = re.search(
-                r"^###\s+0\.4\s+Mandatory Phase 0 Exit Gates(.*?)(?=^##|\Z)",
-                todo_txt,
-                re.MULTILINE | re.DOTALL,
+        if not todo_p.is_file():
+            raise ValueError(f"Phase {phase} release ({tag}) blocked: missing required {todo_p}")
+        todo_txt = todo_p.read_text(encoding="utf-8")
+        sec_m = re.search(
+            r"^###\s+0\.4\s+Mandatory Phase 0 Exit Gates(.*?)(?=^##|\Z)",
+            todo_txt,
+            re.MULTILINE | re.DOTALL,
+        )
+        if not sec_m:
+            raise ValueError(
+                f"Phase {phase} release ({tag}) blocked: TODO.md missing required '### 0.4 Mandatory Phase 0 Exit Gates' section"
             )
-            if sec_m and "- [ ]" in sec_m.group(1):
-                raise ValueError(
-                    f"Phase {phase} release ({tag}) blocked: TODO.md section 0.4 still has unchecked Phase 0 exit gates"
-                )
+        sec_body = sec_m.group(1)
+        if "- [ ]" in sec_body:
+            raise ValueError(
+                f"Phase {phase} release ({tag}) blocked: TODO.md section 0.4 still has unchecked Phase 0 exit gates"
+            )
+        if "- [x]" not in sec_body:
+            raise ValueError(
+                f"Phase {phase} release ({tag}) blocked: TODO.md section 0.4 contains no completed ('- [x]') exit gate items"
+            )
 
     return {
         "tag": tag,

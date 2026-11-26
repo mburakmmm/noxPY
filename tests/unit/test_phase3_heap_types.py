@@ -496,10 +496,15 @@ class TestPhase3HeapTypes(unittest.TestCase):
         if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
             self.skipTest(f"Native Phase 3 build test targets macOS/Linux; got {sys.platform}")
 
+        require_native = os.environ.get("NOXPY_REQUIRE_NATIVE") == "1"
         tc = _find_noxc()
         py315t = _find_315t()
         if not tc:
+            if require_native:
+                self.fail("NOXPY_REQUIRE_NATIVE=1 set, but noxc >= 2.2.87 toolchain not installed")
             self.skipTest("noxc >= 2.2.87 toolchain not installed")
+        if require_native and not py315t:
+            self.fail("NOXPY_REQUIRE_NATIVE=1 set, but free-threaded python3.15t not found")
 
         noxc_p, noxrt_p, nox_inc = tc
         cc = shutil.which("clang") or shutil.which("cc")
@@ -563,7 +568,7 @@ class TestPhase3HeapTypes(unittest.TestCase):
             else:
                 ver = work / "exp.ver"
                 ver.write_text("{\n  global: PyModExport__noxpy_p3_test;\n  local: *;\n};\n", encoding="utf-8")
-                cflags.extend(["-shared", f"-Wl,--version-script,{ver}", "-pthread"])
+                cflags.extend(["-shared", f"-Wl,--version-script,{ver}", "-pthread", "-lm"])
 
             res_cc = subprocess.run(
                 [
@@ -584,7 +589,7 @@ class TestPhase3HeapTypes(unittest.TestCase):
             self.assertTrue(audit.exports)
 
             verify_script = """
-import concurrent.futures, gc, sys, threading
+import concurrent.futures, gc, os, sys, threading
 import _noxpy_p3_test as m
 
 # Custom exception + construction + methods + properties + repr + eq + immutability + unhashable
@@ -689,7 +694,7 @@ b_par = threading.Barrier(8)
 def par_worker(idx: int) -> int:
     inst = m.Counter(idx, policy="parallel")
     b_par.wait(timeout=10.0)
-    res = inst.work_loop(1500000)
+    res = inst.work_loop(12000000)
     inst.close()
     return res
 
@@ -698,7 +703,8 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
 assert len(outs) == 8
 if not sys._is_gil_enabled():
     peak = m.peak_in_flight()
-    assert peak == 8, f"expected peak_in_flight == 8 on free-threaded 3.15t, got {peak}"
+    expected_min = 8 if (os.cpu_count() or 8) >= 4 else max(2, os.cpu_count() or 2)
+    assert peak >= expected_min, f"expected peak_in_flight >= {expected_min} on free-threaded 3.15t, got {peak}"
 
 # thread_affine enforcement
 aff = m.Counter(3, policy="thread_affine")

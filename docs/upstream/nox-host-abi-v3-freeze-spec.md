@@ -12,12 +12,13 @@
 
 | ID | Unlocks NoxPy Phase | Scope | Blocking? |
 |---|---|---|---|
-| `UR-009` | **Phase 3 (`0.3`: Native Classes)** | `@export class` / methods / properties / static & classmethods / custom exceptions in `expand --json` + `--host-abi` | Yes for Phase 3 Slice 3B+ auto-codegen (`NoxHostHandle` runtime works in `v2.2.87`) |
-| `UR-010` | **Phase 4 (`0.4`: Callbacks & Python Objects)** | `NoxHostExternalRef` + `NoxHostCallbackOps` + unlock-around-callback reentrancy + Python exception token preservation | Yes for Phase 4 callbacks |
+| `UR-009` | **Phase 3 (`0.3`: Native Classes)** | `@export class` / methods / properties / static & classmethods / custom exceptions in `expand --json` + `--host-abi`, `nox_host_handle_type_name`, `NOX_HOST_VALUE_HANDLE` (compatible with both context-per-instance and shared owner-context) | Yes for Phase 3 Slice 3B+ auto-codegen (`NoxHostHandle` runtime works in `v2.2.87`) |
+| `UR-010` | **Phase 4 (`0.4`: Callbacks & Python Objects)** | `NoxHostExternalRef` + `NoxHostCallbackOps` + **owner-thread reentrant suspended state** (`owner_tid`, `call_depth`, `suspended_for_callback`) + Python exception token preservation | Yes for Phase 4 callbacks |
 | `UR-011` | **Phase 4 (`0.4`: Async Tasks)** | `@export async def` C task handles (`NoxHostTask`), completion callback, cancellation (`NOX_HOST_ERR_CANCELLED`), deadlock containment | Yes for Phase 4 `@pyasync` (`@pyiterator` needs only `UR-009`) |
 | `UR-012` | **Phase 5 & 6 (`0.5/0.6`: Buffers, NumPy, Atlas, Arrow)** | Pinned contiguous zero-copy buffers (`nox_host_handle_pin_buffer` / `unpin`) + bulk typed array values (`NoxHostDType`) | Yes for zero-copy buffers / NumPy / Atlas / Arrow |
 | `UR-013` | **Phase 4/6/7 (`0.4/0.6/1.0`: Allocator, Subinterpreters, Windows P0)** | Wire `NoxHostAllocator`, `nox_host_capabilities()`, subinterpreter global-state isolation audit, Windows COFF `.dll`/`.obj` `--host-abi` parity | Yes for subinterpreters, Windows P0, and custom allocators |
-| `UR-014` | **Phase 7 (`1.0`: Zig Bootstrap Freeze)** | Freeze `nox_host.h` v3 in `docs/apis/stability.md`, add C ABI layout `_Static_assert` gate, allow `b"..."` default literal in checker | Yes for `nox-lang` self-hosting ABI freeze |
+| `UR-014` | **Phase 7 (`1.0`: Staged ABI Freeze `v3-rc` -> `v3-stable`)** | Stage 1 (`v3-rc` for Zig bootstrap): C11 `_Static_assert` layout freeze + append-only structs/enums + `b"..."` default literal; Stage 2 (`v3-stable` for NoxPy `1.0`): promote in `docs/apis/stability.md` after Phases 3–6 validation | Yes for `nox-lang` self-hosting (`v3-rc`) and `1.0` (`v3-stable`) |
+| `UR-015` | **Phase 7 (`1.0`: Hosted Recoverable Trap Containment)** | Recoverable integer overflow (`NOX_HOST_ERR_OVERFLOW = 11`) and OOM (`NOX_HOST_ERR_NOMEM = 2`) under `--host-abi` instead of process-fatal `haltProcess` | Yes for `1.0` production safety (`AGENTS.md` §6, §11) |
 
 *(Language note: `list[int | None]` / boxed-optional scalar inside containers can remain a documented typechecker limit in Phase 2/3, OR be lifted independently without changing `nox_host.h`.)*
 
@@ -80,12 +81,15 @@ In `v2.2.87`, `noxc expand --json` (`compiler/main.zig:3958`) only iterates top-
    - `NoxHostStatus nox_host_handle_type_name(NoxHostContext *ctx, NoxHostHandle h, NoxHostSpan *out);` (borrowed class name while `h` is valid; allows runtime type verification across module boundaries).
    - Add `#define NOX_HOST_VALUE_HANDLE 9` (`nox_host_value_handle(ctx, NoxHostHandle h, NoxHostValue *out)` & `nox_host_value_get_handle(ctx, NoxHostValue v, NoxHostHandle *out)`) so `Class | None` or containers of handles can traverse `NoxHostValue` cleanly without exposing class layouts.
 
+### 4. Shared Owner-Context / Arena Compatibility Note
+While Phase 3A uses **context-per-instance** for zero-contention parallelism across independent heavy objects, `NoxHostHandle` natively allows multiple handles to coexist inside a single `NoxHostContext`. Generated `UR-009` method dispatchers MUST validate and accept two or more `NoxHostHandle` arguments from the *same* `NoxHostContext` (e.g., `a.dot(b)`) and enforce generation/type checks per handle, keeping the door open for an optional NoxPy **shared owner-context / arena** policy for 100k+ small objects (Atlas/Noxen) without changing `nox_host.h`.
+
 ---
 
 ## `UR-010` — Managed Host Object Handles & Reentrant Callbacks (Phase 4)
 
 ### 1. Design Contract
-Nox code inside an extension must be able to hold and invoke opaque host objects (`PyObject` wrapped safely by NoxPy on the CPython side) without Nox ever dereferencing `PyObject*` or deadlocking `NoxHostContext.lock`.
+Nox code inside an extension must be able to hold and invoke opaque host objects (`PyObject` wrapped safely by NoxPy on the CPython side) without Nox ever dereferencing `PyObject*`, without deadlocking same-thread reentrant host -> Nox calls, and **without opening a data race for foreign threads while `ctx` is suspended waiting on a callback**.
 
 ### 2. Required C ABI (`include/nox_host.h`)
 ```c
@@ -95,7 +99,9 @@ typedef uint64_t NoxHostExternalRef; /* opaque host-managed object token; 0 = in
 typedef struct NoxHostCallbackOps {
     uint32_t struct_size;
     void *user_data;
-    /* Called with ctx->lock UNLOCKED so reentrant host -> Nox calls cannot deadlock.
+    /* Called with ctx pinned to the invoking OS thread in `suspended_for_callback` state:
+     * same-thread reentrant host -> Nox calls on `ctx` succeed safely, while foreign threads
+     * attempting to enter `ctx` block (or receive NOX_HOST_ERR_BUSY) until call_depth == 0.
      * `args_tuple` is a borrowed NOX_HOST_VALUE_TUPLE; callback owns `*out_result` if set.
      * If host raises an exception, return NOX_HOST_ERR_HOST_EXCEPTION, set `*out_err_token`
      * (opaque host handle kept until `error_release`), and optional UTF-8 `*out_err_msg`. */
@@ -116,13 +122,22 @@ uint64_t nox_host_error_host_token(const NoxHostError *err); /* 0 if Nox-origina
 ```
 Also add `#define NOX_HOST_VALUE_EXTERNAL_REF 11` (`nox_host_value_external_ref` / `nox_host_value_get_external_ref`) if external refs pass inside `NoxHostValue` containers.
 
-### 3. Critical Reentrancy Rule (`runtime/host.zig`)
-When Nox invokes a host callback through the runtime helper (`nox_host_call_external`):
+### 3. Critical Reentrancy Rule — Owner-Thread Suspended State (`runtime/host.zig`)
+Unlocking `ctx.lock` globally before a host callback prevents same-thread deadlock, **but allows a foreign OS thread to enter `ctx` and mutate suspended Nox stack/ARC state**. Therefore `NoxHostContext` MUST track `owner_tid` (`0` = idle), `call_depth` (`uint32_t`), and `suspended_for_callback` (`bool`) under its internal mutex + condition variable (or futex):
 1. Validate `ctx.callback_ops != null` (else raise Nox `RuntimeError`).
-2. Marshall Nox arguments into temporary `NoxHostValue` tuple under `ctx.lock`.
-3. **Unlock `ctx.lock`** -> call `cb_ops.invoke(...)` -> **re-lock `ctx.lock`** and re-establish `handOverArcOwner(ctx.rt)`.
+2. Entering any `nox_host_*` context call checks `owner_tid`:
+   - If `owner_tid == 0`: claim `owner_tid = current_tid`, `call_depth = 1`, `suspended_for_callback = false`.
+   - If `owner_tid == current_tid` and `suspended_for_callback == true`: increment `call_depth` and allow clean same-thread reentry (saving outer suspended state and restoring `suspended_for_callback` on return).
+   - If `owner_tid == current_tid` and `suspended_for_callback == false`: reject with `NOX_HOST_ERR_STATE` (unsupported non-callback same-thread recursion inside runtime lock).
+   - If `owner_tid != 0` and `owner_tid != current_tid`: **foreign threads MUST wait** on the condition variable until `call_depth == 0` (or return `NOX_HOST_ERR_BUSY` for explicit non-blocking entry). Foreign threads NEVER interleave with a suspended callback frame.
+3. Around `cb_ops.invoke(...)`:
+   - Marshall Nox arguments into temporary `NoxHostValue` tuple while holding `owner_tid`.
+   - Set `suspended_for_callback = true` and release only the internal wait mutex (keeping `owner_tid == current_tid` and `call_depth >= 1` claimed!).
+   - Call `cb_ops.invoke(...)`.
+   - Re-acquire internal mutex, set `suspended_for_callback = false`, and re-establish `handOverArcOwner(ctx.rt)`.
 4. If `invoke` returns `NOX_HOST_ERR_HOST_EXCEPTION`: propagate `*out_err_token` so if uncaught in Nox, `nox_host_capture` returns `NOX_HOST_ERR_HOST_EXCEPTION` and `nox_host_error_host_token(err)` lets NoxPy restore the original Python exception + traceback verbatim (`AGENTS.md` §11).
-5. When Nox destroys a retained external ref via ARC (`releaseObject`), invoke `cb_ops.release` with `ctx.lock` unlocked.
+5. `nox_host_context_destroy(ctx)` MUST reject (`NOX_HOST_ERR_BUSY`) or defer teardown while `call_depth > 0`.
+6. When Nox destroys a retained external ref via ARC (`releaseObject`), invoke `cb_ops.release` under the exact same `suspended_for_callback` / outside-mutex rule (or defer to boundary exit) so Python `__del__` finalizers can neither deadlock nor expose torn state to foreign threads.
 
 ### 4. `noxc expand --json` Support
 Emit `"marshal": "external_ref"` / `"return_marshal": "external_ref"` for opaque host object parameters/returns (and corresponding C parameter/return `NoxHostExternalRef`).
@@ -252,6 +267,7 @@ NoxHostStatus nox_host_value_get_typed_array(
    #define NOX_HOST_CAP_TYPED_ARRAYS      (1ULL << 5)
    #define NOX_HOST_CAP_CUSTOM_ALLOCATOR  (1ULL << 6)
    #define NOX_HOST_CAP_SUBINTERPRETERS   (1ULL << 7)
+   #define NOX_HOST_CAP_RECOVERABLE_TRAPS (1ULL << 8)
    uint64_t nox_host_capabilities(void);
    ```
 3. **Subinterpreter safety (`NOX_HOST_CAP_SUBINTERPRETERS`):**
@@ -261,22 +277,48 @@ NoxHostStatus nox_host_value_get_typed_array(
 
 ---
 
-## `UR-014` — Zig Host ABI Freeze Gate (`1.0` Readiness)
+## `UR-014` — Staged Zig Host ABI Freeze (`v3-rc` -> `v3-stable`)
 
-1. **`docs/apis/stability.md` promotion:** Promote `Host ABI (nox_host.h)` from **experimental** to **stable (append-only, same promise as NNI v1)**: existing struct sizes, enum IDs, status codes (`0..10`), and v1/v2/v3 function signatures are frozen; future additions only append new functions/fields/capabilities.
-2. **ABI Freeze Regression Test (`tests/compat/host_abi/`):** Add a C11 `_Static_assert` test pinning `sizeof`/`offsetof` for `NoxHostContextConfig`, `NoxHostSpan`, `NoxHostBuffer`, `NoxHostCallbackOps`, `NoxHostBufferView`, and `NOX_HOST_ABI_VERSION`.
-3. **Minor Phase 2 checker polish:** Allow constant `b"..."` bytes literals as default parameter values in the typechecker (currently `writeDefaultJson` in `compiler/main.zig:3883` already serializes `.bytes_lit` to JSON, only the checker error message rejects it).
+Rather than marking `nox_host.h` v3 "stable" immediately upon initial implementation before NoxPy Phases 3–6 exercise classes, reentrant callbacks, async tasks, pinned buffers, and recoverable traps in production usage, freeze `nox_host.h` in two disciplined stages:
+
+1. **Stage 1 (`v3-rc`, Zig self-hosting bootstrap gate):**
+   - Freeze the binary struct layouts, enum IDs, status codes (`0..11`), and existing v1/v2/v3 signatures as **append-only** (any later Phase 3–6 refinements can only append new functions, flags, or capability bits, never shrink/reorder structs or reuse status codes).
+   - Add a C11 `_Static_assert` regression test (`tests/compat/host_abi/`) pinning `sizeof`/`offsetof` for `NoxHostContextConfig`, `NoxHostSpan`, `NoxHostBuffer`, `NoxHostValue`, `NoxHostCallbackOps`, `NoxHostBufferView`, and `NOX_HOST_ABI_VERSION`.
+   - Allow constant `b"..."` bytes literals as default parameter values in the typechecker (`compiler/main.zig:3883`'s `writeDefaultJson` already serializes `.bytes_lit` to JSON; only the checker error rejects it).
+2. **Stage 2 (`v3-stable`, NoxPy `1.0` gate):**
+   - Promote `Host ABI (nox_host.h)` from `v3-rc` / experimental to **stable (append-only, same promise as NNI v1)** in `docs/apis/stability.md` ONLY after NoxPy Phases 3–6 (`UR-009`..`UR-013`, `UR-015`) pass real end-to-end integration and sanitizer tests.
+
+---
+
+## `UR-015` — Hosted Recoverable Integer Overflow & OOM Containment (Pre-1.0 Production Gate)
+
+### 1. Design Contract (`AGENTS.md` §6, §11)
+Under `v2.2.87`, values exceeding signed 64-bit bounds at the Python->C argument boundary raise `OverflowError`, **but signed 64-bit arithmetic overflow or heap allocation failure inside compiled Nox code (`add(2**63 - 1, 1)` or allocator exhaustion) triggers `haltProcess` / process termination**, killing the entire CPython interpreter process instead of returning a Python exception. For NoxPy `1.0` production safety, recoverable traps in `--host-abi` builds MUST be contained.
+
+### 2. Required C ABI (`include/nox_host.h`) & Runtime Behavior
+1. Reuse existing `#define NOX_HOST_ERR_NOMEM 2` for hosted OOM and add:
+   ```c
+   #define NOX_HOST_ERR_OVERFLOW 11 /* Recoverable checked integer overflow trap in hosted Nox code */
+   ```
+   Expose `NOX_HOST_CAP_RECOVERABLE_TRAPS` `(1ULL << 8)` in `nox_host_capabilities()`.
+2. Under `--host-abi` (gated cleanly so standalone CLI executables keep their normal fatal crash semantics if desired):
+   - Checked integer overflow/underflow/shift traps and allocation failures propagate through the host error boundary into `nox_host_capture` rather than calling `haltProcess()` / `std.process.exit(1)`.
+   - NoxPy maps `NOX_HOST_ERR_OVERFLOW` -> Python `OverflowError` and `NOX_HOST_ERR_NOMEM` -> Python `MemoryError`, leaving the host CPython interpreter process, other extensions, and unrelated `NoxHostContext`s unharmed (and cleanly releasing partially constructed temporaries in the failing context, or poisoning only that context with `NOX_HOST_ERR_STATE` if recovery is partial and returning a clear diagnostic).
+
+### 3. Acceptance Criteria
+1. `add(2**63 - 1, 1)` inside CPython raises `OverflowError`, does **not** terminate the Python process, and subsequent `add(20, 22) == 42` succeeds on the same module.
+2. Bounded `NoxHostAllocator` returning `NULL` raises Python `MemoryError` without crashing or leaking active handles.
 
 ---
 
 ## Exact `nox-lang` Files Involved (Implementation Checklist for One-Shot Freeze)
 
-| `nox-lang` Path | Role in v3 Freeze |
+| `nox-lang` Path | Role in v3 `v3-rc` -> `v3-stable` |
 |---|---|
-| `include/nox_host.h` | Add `NOX_HOST_ABI_VERSION 3u`, handle type name, callback/task/buffer/capability declarations (append-only) |
-| `runtime/host.zig` | Handle type-name helper, `cb_ops` unlock-around-invoke, async task table/scheduler bridge, buffer pin table, typed array nodes, custom allocator routing, capability bitmask |
-| `compiler/main.zig` | `expand --json` `kind: "class"` / `"exception"`, `is_async`, `"external_ref"` marshal; optional `b"..."` default literal acceptance |
+| `include/nox_host.h` | Add `NOX_HOST_ABI_VERSION 3u`, status codes `8..11` (reusing `NOX_HOST_ERR_NOMEM=2`), handle type name, owner-thread callback/task/buffer/capability declarations (append-only) |
+| `runtime/host.zig` | Handle type-name helper, `owner_tid`/`call_depth`/`suspended_for_callback` reentrancy guard, async task table/scheduler bridge, buffer pin table, typed array nodes, custom allocator routing, recoverable overflow/OOM host containment, capability bitmask |
+| `compiler/main.zig` | `expand --json` `kind: "class"` / `"exception"`, `is_async`, `"external_ref"` marshal; allow `b"..."` default literal |
 | `compiler/host_adapt.zig` | Method/constructor/`@pyclass` container adapters + `async def` task trampoline synthesis |
-| `compiler/codegen_qbe/host_abi.zig` | Exported class constructor/method/property/dunder/async C wrappers |
-| `docs/apis/host-abi.md` & `docs/apis/stability.md` | Document v3 contracts and freeze `nox_host.h` as append-only stable |
-| `tests/compat/host_abi/` & `tests/cli/expand_json_test.zig` | C host tests (callbacks + reentrancy, async + cancel, pinned buffer + busy, subinterpreter isolation, `_Static_assert` ABI layout) |
+| `compiler/codegen_qbe/host_abi.zig` | Exported class constructor/method/property/dunder/async C wrappers + hosted trap containment paths |
+| `docs/apis/host-abi.md` & `docs/apis/stability.md` | Document `v3-rc` contracts (`UR-009`..`UR-015`) and stage `v3-rc` -> `v3-stable` promotion after NoxPy Phase 3–6 validation |
+| `tests/compat/host_abi/` & `tests/cli/expand_json_test.zig` | C host tests (owner-thread reentrant callbacks + foreign-thread exclusion, async + cancel, pinned buffer + busy, overflow/OOM containment, subinterpreter isolation, `_Static_assert` ABI layout) |

@@ -109,14 +109,98 @@ jobs:
           PYTHONPATH: build_ci
         run: |
           "${{ steps.py_ft.outputs.python-path }}" -c 'import sys, _noxpy_shim_test as m; assert not sys._is_gil_enabled(), "did not start free-threaded"; assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"; assert not sys._is_gil_enabled(), "extension re-enabled GIL!"'
+      - name: Run CPython shim under ASan/UBSan
+        run: |
+          mkdir -p build_ci_san
+          PY_INC="$("${{ steps.py_gil.outputs.python-path }}" -c "import sysconfig; print(sysconfig.get_path('include'))")"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            printf "_PyModExport__noxpy_shim_test\n" > build_ci_san/exports.txt
+            clang -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+              -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
+              -bundle -undefined dynamic_lookup -Wl,-exported_symbols_list,build_ci_san/exports.txt \
+              -Inative/include "-I$PY_INC" \
+              -o build_ci_san/_noxpy_shim_test.abi3t.so \
+              tests/unit/shim_test_ext.c native/cpython/noxpy_shim.c
+            PYTHONPATH=build_ci_san UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+              "${{ steps.py_gil.outputs.python-path }}" -c 'import _noxpy_shim_test as m; assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"'
+            PYTHONPATH=build_ci_san UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+              "${{ steps.py_ft.outputs.python-path }}" -c 'import sys, _noxpy_shim_test as m; assert not sys._is_gil_enabled(); assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"; assert not sys._is_gil_enabled()'
+          else
+            printf "{\n  global: PyModExport__noxpy_shim_test;\n  local: *;\n};\n" > build_ci_san/exports.ver
+            gcc -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+              -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
+              -shared -Wl,--version-script,build_ci_san/exports.ver \
+              -Inative/include "-I$PY_INC" \
+              -o build_ci_san/_noxpy_shim_test.abi3t.so \
+              tests/unit/shim_test_ext.c native/cpython/noxpy_shim.c
+            ASAN_LIB="$(gcc -print-file-name=libasan.so)"
+            LD_PRELOAD="$ASAN_LIB" \
+              ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+              UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+              PYTHONPATH=build_ci_san \
+              "${{ steps.py_gil.outputs.python-path }}" -c 'import _noxpy_shim_test as m; assert m.rt_i64(42) == 42; assert m.rt_str("a\x00b") == "a\x00b"'
+          fi
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: abi3t-shim-${{ runner.os }}
           path: build_ci/_noxpy_shim_test.abi3t.so
 
+  native-nox-end-to-end:
+    name: Native Nox Toolchain E2E (${{ matrix.os }} / v2.2.87)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: py_gil
+        with:
+          python-version: "3.15"
+          allow-prereleases: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        id: py_ft
+        with:
+          python-version: "3.15t"
+          allow-prereleases: true
+      - name: Install SHA-256 verified nox-lang v2.2.87
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.nox-lang" /tmp/nox-dl
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.87/nox-lang-v2.2.87-macos-arm64.tar.gz"
+            SHA="4973b066c0685c09fbececaea69939ad17e0daa5af5d76c4dcab7a00efafbaeb"
+            TAR="/tmp/nox-dl/nox.tar.gz"
+            curl -fsSL "$URL" -o "$TAR"
+            echo "$SHA  $TAR" | shasum -a 256 -c -
+          else
+            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.87/nox-lang-v2.2.87-linux-x64.tar.gz"
+            SHA="f57576d69e456bd0bb4e4e2b327caa6ef0378e5162a7079555836169fbd087f2"
+            TAR="/tmp/nox-dl/nox.tar.gz"
+            curl -fsSL "$URL" -o "$TAR"
+            echo "$SHA  $TAR" | sha256sum -c -
+          fi
+          tar -xzf "$TAR" --strip-components=1 -C "$HOME/.nox-lang"
+          echo "$HOME/.nox-lang/bin" >> "$GITHUB_PATH"
+          "$HOME/.nox-lang/bin/noxc" --version
+      - name: Install uv
+        run: |
+          "${{ steps.py_gil.outputs.python-path }}" -m pip install --quiet uv
+      - name: Run Nox language tests, fuzz, Phase 3A heap types, and Phase 1/2 real wheels
+        env:
+          NOXPY_REQUIRE_NATIVE: "1"
+          NOXPY_PYTHON_315T: ${{ steps.py_ft.outputs.python-path }}
+        run: |
+          noxc test tests/nox
+          "${{ steps.py_gil.outputs.python-path }}" -m unittest discover -s tests/fuzz -v
+          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/unit/test_phase3_heap_types.py -v
+          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/packaging/test_phase1_wheels.py tests/packaging/test_phase2_packaging.py -v
+
   ci-summary:
     name: CI Gate Summary
-    needs: [hygiene-and-workflows, python-unit-and-codegen, native-abi3t-shim-dual-mode]
+    needs: [hygiene-and-workflows, python-unit-and-codegen, native-abi3t-shim-dual-mode, native-nox-end-to-end]
     runs-on: ubuntu-latest
     steps:
       - name: Report CI pass

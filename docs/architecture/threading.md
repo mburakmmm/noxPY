@@ -35,3 +35,10 @@ To prevent deadlocks across Python reference drops, module shutdown, and instanc
 - `noxpy_obj_enter_call` validates `initialized`, `type_tag`, `thread_policy` (`thread_affine` TID match), `closed == 0`, `handle_is_valid`, and module lease (`noxpy_module_lease_acquire`) while attached to a valid `PyThreadState`.
 - Native execution detaches Python thread state (`Py_BEGIN_ALLOW_THREADS` ... `Py_END_ALLOW_THREADS`) and never manipulates `PyObject*` while detached.
 - `close()`, `__exit__()`, `tp_clear()`, and `tp_dealloc()` funnel through idempotent `noxpy_obj_close()`.
+
+## 5. Module-Level Mutable Global State Semantics (Context Pooling Contract)
+
+Because top-level `@export` functions execute against a **per-module pool of independent `NoxHostContext` instances** (`noxpy_shim.c`), each pooled `NoxHostContext` owns an isolated `RuntimeState` and module-level Nox variables.
+
+- **Contract:** Writes to module-level mutable Nox globals inside top-level `@export` functions are **context-local scratch only** — they are **not** shared across concurrent threads, unrelated calls that hit different pooled contexts, or pool eviction.
+- **Normative rule:** Top-level `@export` functions MUST treat module-level Nox globals as immutable configuration/constants. Cross-call and cross-thread shared mutable state MUST be modeled via an explicit Phase 3 native class instance governed by `NOXPY_POLICY_INSTANCE_LOCKED` (or `NOXPY_POLICY_THREAD_AFFINE` when pinned to one OS thread).

@@ -96,6 +96,36 @@ class TestReleaseGate(unittest.TestCase):
             with self.assertRaises(ValueError):
                 evaluate_release_gate(root, "v0.0.1a0")
 
+    def test_phase1_blocked_when_todo_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _make_fake_repo(root, version="0.1.0a1", with_unchecked_phase0=False)
+            (root / "TODO.md").unlink()
+            with self.assertRaises(ValueError) as ctx:
+                evaluate_release_gate(root, "v0.1.0a1")
+            self.assertIn("missing required", str(ctx.exception))
+
+    def test_phase1_blocked_when_phase0_section_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _make_fake_repo(root, version="0.1.0a1", with_unchecked_phase0=False)
+            (root / "TODO.md").write_text("# TODO\n\n## Phase 1\n- [x] Done\n", encoding="utf-8")
+            with self.assertRaises(ValueError) as ctx:
+                evaluate_release_gate(root, "v0.1.0a1")
+            self.assertIn("Mandatory Phase 0 Exit Gates", str(ctx.exception))
+
+    def test_phase1_blocked_when_phase0_section_has_no_checked_items(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _make_fake_repo(root, version="0.1.0a1", with_unchecked_phase0=False)
+            (root / "TODO.md").write_text(
+                "### 0.4 Mandatory Phase 0 Exit Gates\nNothing completed yet.\n\n## Phase 1\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                evaluate_release_gate(root, "v0.1.0a1")
+            self.assertIn("no completed", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

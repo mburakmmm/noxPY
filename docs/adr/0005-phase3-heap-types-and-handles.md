@@ -19,6 +19,9 @@ Phase 3 introduces stateful native Python classes wrapping Nox objects exposed o
    - Therefore, giving each Python wrapper instance its own initialized `NoxHostContext *owner_ctx` + `NoxHostHandle handle` achieves **100% lock-free parallelism across distinct instances** on `python3.15t` while preserving generation-checked handle safety.
    - Because handles cannot cross `NoxHostContext` boundaries, Phase 3 wrapper classes treat `owner_ctx` as the exclusive owner of `handle`, paired with a per-instance `pthread_mutex_t` for `instance_locked` access and safe `close()` serialization.
 
+   ### Future Shared Owner-Context / Arena Option (Phase 3B / Phase 5)
+   While `context-per-instance` eliminates cross-object lock contention and isolates failures, allocating a separate `NoxHostContext` per Python wrapper carries per-context runtime overhead when workloads instantiate 100k+ tiny objects (e.g. `Atlas` tensors/nodes or `Noxen` AST values), and prevents two independent instances from participating in binary native methods such as `a.dot(b)`. Once `UR-009` and Phase 5–6 arrive, NoxPy MAY offer an explicit **shared owner-context / arena** policy (pooled per module or explicit arena object), trading per-instance isolation for minimal memory footprint and same-context multi-handle dispatch without changing `NoxHostHandle` C ABI contracts (`context-per-instance` vs `shared-owner-context` benchmarked before adoption).
+
 3. **GC & Idempotent Shutdown Contracts (`AGENTS.md` §9, §10.5):**
    - Each live instance holds a strong reference to `owner_module` (`Py_NewRef`), exposed via `Py_tp_traverse` (`Py_VISIT(Py_TYPE(self)); Py_VISIT(data->owner_module);`) and cleared in `Py_tp_clear`.
    - `noxpy_obj_close(data)` swaps `(owner_ctx, handle, owner_module, host_ops)` out under `data->lock`, marks `closed = 1`, releases `data->lock`, and **outside any lock** invokes `handle_release`, `module_fini` + `context_destroy`, and `Py_DECREF(owner_module)`.

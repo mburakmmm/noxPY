@@ -148,6 +148,58 @@ def _find_c_compiler() -> str:
     return cc
 
 
+def _c_compiler_version(cc: str) -> str:
+    """Return a normalized C compiler version string for deterministic cache keys."""
+    try:
+        res = subprocess.run([cc, "--version"], capture_output=True, text=True)
+    except OSError:
+        return "unknown"
+    text = (res.stdout + "\n" + res.stderr).strip()
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(lines[:2]) if lines else "unknown"
+
+
+_CACHE_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        ".noxpy-cache",
+        "build",
+        "dist",
+        ".venv",
+        "venv",
+        "__pycache__",
+        "node_modules",
+        ".mypy_cache",
+    }
+)
+
+
+def _collect_project_nox_sources(proj_root: Path, entry_source: Path) -> tuple[tuple[str, bytes], ...]:
+    """Collect all project `.nox` files (and `entry_source`) sorted by normalized path for transitive cache invalidation."""
+    root_resolved = proj_root.resolve()
+    entry_resolved = entry_source.resolve()
+    collected: dict[str, bytes] = {}
+
+    if root_resolved.is_dir():
+        for dirpath, dirnames, filenames in os.walk(root_resolved):
+            dirnames[:] = sorted(d for d in dirnames if d not in _CACHE_SKIP_DIRS)
+            for fname in sorted(filenames):
+                if not fname.endswith(".nox"):
+                    continue
+                fpath = (Path(dirpath) / fname).resolve()
+                rel = fpath.relative_to(root_resolved).as_posix()
+                collected[rel] = fpath.read_bytes()
+
+    if entry_resolved.is_file():
+        try:
+            entry_key = entry_resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            entry_key = f"__external__/{entry_resolved.as_posix()}"
+        collected[entry_key] = entry_resolved.read_bytes()
+
+    return tuple((k, collected[k]) for k in sorted(collected))
+
+
 def _find_python_abi3t_include() -> Path:
     py_inc = sysconfig.get_path("include")
     if not py_inc:
@@ -278,29 +330,36 @@ def _compute_cache_key(
     *,
     noxc_sha: str,
     noxrt_sha: str,
+    cc_version: str,
+    upstream_host_h_bytes: bytes,
     pyproject_bytes: bytes,
-    source_bytes: bytes,
+    nox_sources: tuple[tuple[str, bytes], ...],
     lock_digest: str,
     native_root: Path,
     release: bool,
     plat_tag: str,
 ) -> str:
     h = hashlib.sha256()
-    for part in (
+    parts: list[bytes] = [
         __version__.encode("utf-8"),
         noxc_sha.encode("utf-8"),
         noxrt_sha.encode("utf-8"),
+        cc_version.encode("utf-8"),
+        upstream_host_h_bytes,
         lock_digest.encode("utf-8"),
         b"release=1" if release else b"release=0",
         plat_tag.encode("utf-8"),
         (Path(__file__).resolve().parent / "codegen.py").read_bytes(),
         (Path(__file__).resolve().parent / "ir.py").read_bytes(),
         pyproject_bytes,
-        source_bytes,
         (native_root / "include" / "noxpy_abi.h").read_bytes(),
         (native_root / "include" / "nox_host.h").read_bytes(),
         (native_root / "cpython" / "noxpy_shim.c").read_bytes(),
-    ):
+    ]
+    for rel_path, src_bytes in sorted(nox_sources):
+        parts.append(rel_path.encode("utf-8"))
+        parts.append(src_bytes)
+    for part in parts:
         h.update(len(part).to_bytes(8, "little"))
         h.update(part)
     return h.hexdigest()
@@ -317,14 +376,18 @@ def _compile_and_audit_extension(
     noxc_p, noxrt_p, nox_inc, noxc_ver, noxc_sha, noxrt_sha = _find_nox_toolchain()
     if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
         raise NoxPyError("NPY-E-CONFIG", f"Extension linking not yet implemented on {sys.platform}")
+    cc = _find_c_compiler()
+    cc_version = _c_compiler_version(cc)
     lock_digest = compute_lock_digest(proj_root)
     plat_tag = compute_platform_tag()
 
     cache_key = _compute_cache_key(
         noxc_sha=noxc_sha,
         noxrt_sha=noxrt_sha,
+        cc_version=cc_version,
+        upstream_host_h_bytes=(nox_inc / "nox_host.h").read_bytes(),
         pyproject_bytes=(proj_root / "pyproject.toml").read_bytes(),
-        source_bytes=cfg.source_path.read_bytes(),
+        nox_sources=_collect_project_nox_sources(proj_root, cfg.source_path),
         lock_digest=lock_digest,
         native_root=native_root,
         release=release,
@@ -347,7 +410,6 @@ def _compile_and_audit_extension(
         except (OSError, json.JSONDecodeError, NoxPyError):
             pass  # Fall through to clean recompile if cache entry is corrupt
 
-    cc = _find_c_compiler()
     py_inc = _find_python_abi3t_include()
     ir = inspect_module_ir(proj_root, cfg, noxc_path=noxc_p)
     c_src = generate_c_adapter(ir)

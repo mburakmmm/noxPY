@@ -40,17 +40,30 @@ def writable_array(buf: Any) -> Iterator[Any]:
     """Acquire an exclusive zero-copy writable `numpy.ndarray` view over a Nox buffer.
 
     Guarantees deterministic unpinning on exit (so subsequent Nox `resize()` or new
-    pins never see leaked exclusive locks). Raises `BufferError` if another view is
-    currently pinned.
+    pins never see leaked exclusive locks) and revokes write permission on `arr` before
+    returning so escaped references cannot silently mutate unpinned storage. Raises
+    `BufferError` if another view is already pinning the buffer on entry.
     """
     np = _require_numpy()
     proxy = buf.writable()
     mv = memoryview(proxy)
+    arr = np.frombuffer(mv, dtype=np.dtype(mv.format))
+    base_mv = arr.base if isinstance(arr.base, memoryview) else None
     try:
-        arr = np.frombuffer(mv, dtype=np.dtype(mv.format))
         yield arr
     finally:
-        mv.release()
+        arr.setflags(write=False)
+        try:
+            mv.release()
+        finally:
+            if base_mv is not None:
+                try:
+                    base_mv.release()
+                except BufferError as exc:
+                    raise BufferError(
+                        "noxpy.numpy_adapter.writable_array: exported view still holds an active "
+                        "sub-buffer pin on exit"
+                    ) from exc
 
 
 def as_typed_input(arr: Any, *, allow_copy: bool = False) -> Any:

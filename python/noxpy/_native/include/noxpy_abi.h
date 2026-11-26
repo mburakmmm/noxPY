@@ -146,6 +146,12 @@ typedef struct NoxPyHostOps {
 
 typedef struct NoxPyExtRefTable NoxPyExtRefTable;
 
+typedef struct NoxPyRetiredCtx {
+    const NoxPyHostOps *ops;
+    NoxHostContext *ctx;
+    struct NoxPyRetiredCtx *next;
+} NoxPyRetiredCtx;
+
 /*
  * Interpreter-local per-module state stored in CPython module state (`PyModule_GetState`).
  * Contains zero process-global invocation locks; caches up to NOXPY_CTX_POOL_CAP independent
@@ -166,6 +172,10 @@ typedef struct NoxPyModuleState {
     PyObject *buf_types[4];
     PyObject *writable_proxy_type;
     int64_t owner_interp_id;
+    PyInterpreterState *owner_interp;
+    noxpy_mutex_t retired_mu;
+    int retired_mu_ready;
+    NoxPyRetiredCtx *retired_head;
 } NoxPyModuleState;
 
 /*

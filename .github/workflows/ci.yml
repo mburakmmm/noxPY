@@ -196,7 +196,7 @@ jobs:
           noxc test tests/nox
           "${{ steps.py_gil.outputs.python-path }}" -m unittest discover -s tests/fuzz -v
           "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/unit/test_phase3_heap_types.py -v
-          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/packaging/test_phase1_wheels.py tests/packaging/test_phase2_packaging.py tests/packaging/test_phase3_classes.py tests/packaging/test_phase4_callbacks_async.py tests/packaging/test_phase5_buffers_atlas.py tests/packaging/test_phase6_arrow_noxen_subinterp.py -v
+          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/packaging/test_phase1_wheels.py tests/packaging/test_phase2_packaging.py tests/packaging/test_phase3_classes.py tests/packaging/test_phase4_callbacks_async.py tests/packaging/test_phase5_buffers_atlas.py tests/packaging/test_phase6_arrow_noxen_subinterp.py tests/packaging/test_phase6_5_hardening.py tests/packaging/test_phase6_5_universal_packages.py -v
 
   windows-nox-toolchain-smoke:
     name: Windows Toolchain & Unit Smoke (windows-latest / v2.2.95)

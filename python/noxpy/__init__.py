@@ -14,7 +14,7 @@ from .ir import (
     parse_upstream_metadata_json,
 )
 
-__version__ = "0.6.0a1"
+__version__ = "0.6.5a1"
 
 __all__ = [
     "__version__",

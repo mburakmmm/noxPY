@@ -23,6 +23,7 @@ from .doctor import collect_doctor_report
 from .errors import NoxPyError
 from .ir import parse_upstream_metadata_json
 from .lockfile import compute_lock_digest
+from .pkg_bridge import generate_package_wrapper, inspect_nox_package
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -47,6 +48,28 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
+    if args.compatibility:
+        mods = [m for m in (args.modules or "").split(",") if m.strip()] or None
+        report = inspect_nox_package(args.compatibility, modules=mods)
+        if args.json:
+            sys.stdout.write(json.dumps(report, indent=2) + "\n")
+        else:
+            s = report["summary"]
+            print(
+                f"Package: {report['package']} {report['version']} "
+                f"(exportable={s['exportable_count']}, "
+                f"needs_specialization={s['needs_specialization_count']}, "
+                f"unsupported={s['unsupported_count']}, "
+                f"subinterpreter_safe={report['subinterpreter_safe']})"
+            )
+            for fn in report["exportable"]:
+                ps = ", ".join(f"{p['name']}: {p['type']}" for p in fn["params"])
+                print(f"  + {fn['module']}.{fn['name']}({ps}) -> {fn['return_type']}")
+            for u in report["unsupported"][:10]:
+                label = u.get("symbol") or f"{u['module']}.{u['name']}"
+                print(f"  - {label}: {u['reason']}")
+        return 0
+
     pyproject_path = Path(args.pyproject).resolve()
     cfg = load_pyproject(pyproject_path)
     lock_digest = compute_lock_digest(pyproject_path.parent)
@@ -163,6 +186,27 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
+    if args.from_nox_package:
+        mods = [m for m in (args.modules or "").split(",") if m.strip()] or None
+        sel = [s for s in (args.select or "").split(",") if s.strip()] or None
+        out_dir = Path(args.out).resolve() if args.out else Path(args.project).resolve()
+        res = generate_package_wrapper(
+            args.from_nox_package,
+            out_dir,
+            module_name=args.module_name,
+            modules=mods,
+            select=sel,
+            fetch=bool(args.fetch),
+        )
+        if args.json:
+            sys.stdout.write(json.dumps(res, indent=2) + "\n")
+        else:
+            print(
+                f"Generated wrapper for {res['source_package']} in {res['wrapper_dir']} "
+                f"({len(res['exported_functions'])} exports)"
+            )
+        return 0
+
     created = init_project(args.project)
     if args.json:
         sys.stdout.write(json.dumps({"status": "ok", "created": created}, indent=2) + "\n")
@@ -188,10 +232,12 @@ def main(argv: list[str] | None = None) -> int:
     p_doc.add_argument("--json", action="store_true")
     p_doc.set_defaults(func=_cmd_doctor)
 
-    p_chk = sub.add_parser("check", help="Validate pyproject.toml, nox.lock, and optional IR.")
+    p_chk = sub.add_parser("check", help="Validate pyproject.toml, nox.lock, IR, or Nox package compatibility.")
     p_chk.add_argument("pyproject", nargs="?", default="pyproject.toml")
     p_chk.add_argument("--ir", help="Path to UR-007 JSON metadata manifest.")
     p_chk.add_argument("--inspect", action="store_true", help="Invoke noxc expand --json on source.")
+    p_chk.add_argument("--compatibility", help="Inspect an existing Nox package dir for Python binding compatibility.")
+    p_chk.add_argument("--modules", help="Comma-separated module filter for --compatibility.")
     p_chk.add_argument("--json", action="store_true")
     p_chk.set_defaults(func=_cmd_check)
 
@@ -226,8 +272,14 @@ def main(argv: list[str] | None = None) -> int:
     p_new.add_argument("--json", action="store_true")
     p_new.set_defaults(func=_cmd_new)
 
-    p_init = sub.add_parser("init", help="Initialize NoxPy metadata in an existing directory.")
+    p_init = sub.add_parser("init", help="Initialize NoxPy metadata or bridge an existing Nox package.")
     p_init.add_argument("project", nargs="?", default=".")
+    p_init.add_argument("--from-nox-package", help="Path to an unmodified Nox package dir to wrap.")
+    p_init.add_argument("--out", "-o", help="Output directory for generated wrapper project.")
+    p_init.add_argument("--module-name", help="Python module name for generated wrapper.")
+    p_init.add_argument("--modules", help="Comma-separated Nox module names to inspect/wrap.")
+    p_init.add_argument("--select", help="Comma-separated exported function names to include.")
+    p_init.add_argument("--fetch", action="store_true", help="Run `noxc fetch` to generate nox.lock.")
     p_init.add_argument("--json", action="store_true")
     p_init.set_defaults(func=_cmd_init)
 

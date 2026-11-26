@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noxpy"
-version = "0.6.0a1"
+version = "0.6.5a1"
 description = "Native Python extensions written in Nox. Free-threaded first (abi3t), safe by design."
 readme = "README.md"
 license = "MIT"

@@ -112,6 +112,14 @@
 
 ---
 
+## Phase 6.5 — `0.6.5`: P0/P1 Hardening, Real NumPy/PyArrow & Universal Nox Package Bindings (Verified on `noxc v2.2.95`)
+- [x] Fix P0-1 subinterpreter callback/async thread-state (`PyThreadState_New` + `PyEval_AcquireThread`/`ReleaseThread`/`Clear`/`Delete` + deferred `Py_DECREF` draining), verified with synchronous callbacks, exceptions, and `asyncio.run(...)` inside concurrent `3.15` / `3.15t` `concurrent.interpreters`.
+- [x] Fix P0-2 async premature loop-close retirement queue (`NoxPyRetiredCtx` drained safely outside worker thread) and P0-3 atomic lock-ordered `close()` vs `bf_getbuffer` + `writable_array` deterministic unpin/read-only guard.
+- [x] Implement P1-1 bulk C-pack `TYPED_ARRAY` fast path for plain Python `list[float]` / `list[int]` / `list[bool]` and P1-2 real `numpy` (`2.5.5`) + `pyarrow` (`26.0.1`) zero-copy end-to-end verification.
+- [x] Implement Universal Nox Package Bindings bridge ([`python/noxpy/pkg_bridge.py`](python/noxpy/pkg_bridge.py), `noxpy check --compatibility`, `noxpy init --from-nox-package`, `[tool.noxpy] export = "public"` across Python & Nox) verified with unmodified git Nox packages + real sibling `noxen` / `atlas` (`UR-016` documented for upstream bare intra-package imports & compiler-owned `--export-public`).
+
+---
+
 ## Phase 7 — `1.0` Stable Release (Locked behind Phase 6)
 - [ ] Finalize stable config, Binding IR schema, and dual `abi3`/`abi3t` policy; publish compatibility matrix.
 - [ ] Complete `README.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `SECURITY.md`, API docs, and migration guides.

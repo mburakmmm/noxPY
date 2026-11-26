@@ -22,6 +22,7 @@ ALLOWED_TOOL_KEYS = frozenset(
         "free-threaded",
         "generate-stubs",
         "python-source",
+        "export",
     }
 )
 
@@ -200,6 +201,14 @@ def load_pyproject(pyproject_path: str | Path) -> NoxPyProjectConfig:
     generate_stubs = noxpy_tbl.get("generate-stubs", True)
     if not isinstance(generate_stubs, bool):
         raise NoxPyError("NPY-E-CONFIG", "[tool.noxpy].generate-stubs must be a boolean", location=loc)
+
+    export_mode = noxpy_tbl.get("export", "explicit")
+    if export_mode not in ("explicit", "public"):
+        raise NoxPyError(
+            "NPY-E-CONFIG",
+            f"Unsupported [tool.noxpy].export {export_mode!r}; expected 'explicit' or 'public'",
+            location=loc,
+        )
 
     py_src_raw = noxpy_tbl.get("python-source")
     py_src_dir = (

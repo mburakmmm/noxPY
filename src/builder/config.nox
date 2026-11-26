@@ -103,6 +103,7 @@ def _is_allowed_tool_key(k: str) -> bool:
         or k == "free-threaded"
         or k == "generate-stubs"
         or k == "python-source"
+        or k == "export"
     )
 
 
@@ -350,6 +351,20 @@ def parse_pyproject_toml(raw_toml: str, source_file: str) -> NoxPyProjectConfig:
         if not nox.toml.is_bool(noxpy_tbl["generate-stubs"]):
             raise make_error("NPY-E-CONFIG", "[tool.noxpy].generate-stubs must be a boolean", source_file, 0, 0, "")
         generate_stubs = noxpy_tbl["generate-stubs"].b
+
+    if "export" in noxpy_tbl:
+        if not nox.toml.is_string(noxpy_tbl["export"]):
+            raise make_error("NPY-E-CONFIG", "[tool.noxpy].export must be a string", source_file, 0, 0, "")
+        exp_mode: str = noxpy_tbl["export"].s
+        if exp_mode != "explicit" and exp_mode != "public":
+            raise make_error(
+                "NPY-E-CONFIG",
+                "Unsupported [tool.noxpy].export '" + exp_mode + "'; expected 'explicit' or 'public'",
+                source_file,
+                0,
+                0,
+                "",
+            )
 
     py_src_rel: str = ""
     if "python-source" in noxpy_tbl:

@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.6.5a1] — 2026-11-26 (Phase 6.5 Alpha: P0/P1 Hardening, Real NumPy/PyArrow & Universal Nox Package Bindings)
+
+### Fixed & Hardened (Phase 6.5-A)
+- **P0-1 Subinterpreter callbacks & async thread-state:** Replaced `PyGILState_Ensure()` in `noxpy_cb_invoke` and `noxpy_async_on_done` with `PyThreadState_New(interp)` / `PyEval_AcquireThread` / `PyThreadState_Clear` / `PyEval_ReleaseThread` / `PyThreadState_Delete` for subinterpreters (`owner_interp_id > 0`), plus deferred `Py_DECREF` queueing (`extref_drain_deferred`) so `noxpy_cb_release` never attaches from an unowned foreign/worker thread. Verified sync callbacks, exception round-trips, and `asyncio.run` inside dual `3.15` & `3.15t` `concurrent.interpreters` in [`tests/packaging/test_phase6_5_hardening.py`](tests/packaging/test_phase6_5_hardening.py).
+- **P0-2 Async abandoned context retirement:** Added per-module `NoxPyRetiredCtx` list (`noxpy_module_retire_ctx` / `noxpy_module_drain_retired`) in [`native/include/noxpy_abi.h`](native/include/noxpy_abi.h) & [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) so async contexts orphaned on premature `loop.close()` are deterministically destroyed outside the worker thread.
+- **P0-3 Atomic buffer `close()` & NumPy `writable_array` unpin:** Moved `active_pins > 0` check inside `data->lock` (`obj_close_checked_impl`) and updated [`python/noxpy/numpy_adapter.py`](python/noxpy/numpy_adapter.py) `writable_array` to revoke `write=False` and deterministically release `arr.base` `memoryview` on exit.
+- **P1-1 Plain Python `list[float|int|bool]` fast C-pack path & P1-2 real `numpy`/`pyarrow` verification:** Added single-pass strict C packing to `NOX_HOST_VALUE_TYPED_ARRAY` inside `py_to_hv_rec` (eliminating the `~2.24 s` per-element value-tree bottleneck while preserving strict `TypeError`/`OverflowError` semantics) and added real `numpy` + `pyarrow` PyCapsule zero-copy tests in [`tests/packaging/test_phase6_5_hardening.py`](tests/packaging/test_phase6_5_hardening.py).
+
+### Added (Phase 6.5-B — Universal Nox Package Bindings)
+- Added [`python/noxpy/pkg_bridge.py`](python/noxpy/pkg_bridge.py) (`inspect_nox_package`, `generate_package_wrapper`), CLI commands `noxpy check --compatibility` and `noxpy init --from-nox-package` ([`python/noxpy/__main__.py`](python/noxpy/__main__.py)), aligned `[tool.noxpy].export` (`"explicit"` | `"public"`) validation in [`python/noxpy/config.py`](python/noxpy/config.py) & [`src/builder/config.nox`](src/builder/config.nox), [`tests/unit/test_pkg_bridge.py`](tests/unit/test_pkg_bridge.py), [`tests/packaging/test_phase6_5_universal_packages.py`](tests/packaging/test_phase6_5_universal_packages.py), [`UR-016`](UPSTREAM_REQUIREMENTS.md), and [`docs/evidence/phase6_5-2026-11-26.md`](docs/evidence/phase6_5-2026-11-26.md).
+
 ## [0.6.0a1] — 2026-11-26 (Phases 5 & 6 Alpha: Zero-Copy Buffers, NumPy, Atlas, Arrow, Noxen & Subinterpreters)
 
 ### Added (Phase 6 — Subinterpreters `UR-013`, Arrow, Noxen, Embedding Policy & Windows CI)

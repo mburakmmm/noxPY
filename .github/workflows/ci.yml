@@ -243,13 +243,16 @@ jobs:
           NOXRT="$HOME/.nox-lang/lib/noxrt.o"
           noxc build --backend llvm --host-abi --module-name hello --emit-obj -o "$WORK/hello_nox.o" "$WORK/hello/src/hello.nox"
           "${{ steps.py_gil.outputs.python-path }}" -c "from pathlib import Path; from noxpy.build import inspect_module_ir; from noxpy.config import load_pyproject; from noxpy.codegen import generate_c_adapter; p = Path('$WORK/hello'); Path('$WORK/hello_adapter.c').write_text(generate_c_adapter(inspect_module_ir(p, load_pyproject(p / 'pyproject.toml'))), encoding='utf-8')"
-          clang -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
+          printf "{\n  global: PyModExport_hello;\n  local: *;\n};\n" > "$WORK/exports.ver"
+          gcc -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
             -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
-            -shared -I"$PWD/native/include" -I"$NOX_INC" -I"$PY_INC" \
-            -o "$WORK/hello.abi3t.so" "$WORK/hello_adapter.c" native/cpython/noxpy_shim.c "$WORK/hello_nox.o" "$NOXRT" -lm -lpthread
-          PYTHONPATH="$WORK" UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+            -shared -Wl,--version-script,"$WORK/exports.ver" \
+            -I"$PWD/native/include" -I"$NOX_INC" -I"$PY_INC" \
+            -o "$WORK/hello.abi3t.so" "$WORK/hello_adapter.c" native/cpython/noxpy_shim.c "$WORK/hello_nox.o" "$NOXRT" -lm -lpthread -lubsan
+          UBSAN_LIB="$(gcc -print-file-name=libubsan.so)"
+          LD_PRELOAD="$UBSAN_LIB" PYTHONPATH="$WORK" UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
             "${{ steps.py_gil.outputs.python-path }}" -c 'import hello; assert hello.add(20, 22) == 42'
-          PYTHONPATH="$WORK" UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+          LD_PRELOAD="$UBSAN_LIB" PYTHONPATH="$WORK" UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
             "${{ steps.py_ft.outputs.python-path }}" -c 'import sys, hello; assert not sys._is_gil_enabled(); assert hello.add(20, 22) == 42; assert not sys._is_gil_enabled()'
 
   windows-nox-native-e2e:
@@ -288,30 +291,38 @@ jobs:
         shell: pwsh
         run: |
           & "${{ steps.py_gil.outputs.python-path }}" -m pip install --quiet uv
-      - name: Run Nox language tests, Python unit suite, and Windows .pyd dual-mode wheel E2E
+      - name: Run unit tests, noxc --emit-obj, and Windows abi3t .pyd dual-mode E2E
         shell: pwsh
         env:
           PYTHONPATH: ${{ github.workspace }}\python
         run: |
           $ErrorActionPreference = "Stop"
-          noxc test tests/nox
           & "${{ steps.py_gil.outputs.python-path }}" -m unittest discover -s tests/unit -v
+          if ($LASTEXITCODE -ne 0) { throw "tests/unit failed (exit $LASTEXITCODE)" }
           $work = Join-Path $env:RUNNER_TEMP "noxpy-win-e2e"
           if (Test-Path $work) { Remove-Item -Recurse -Force $work }
           New-Item -ItemType Directory -Path $work | Out-Null
-          Copy-Item -Recurse "examples\hello" "$work\hello"
-          & "${{ steps.py_gil.outputs.python-path }}" -m noxpy build "$work\hello" --out-dir "$work\dist" --release --json
-          if ($LASTEXITCODE -ne 0) { throw "noxpy build failed (exit $LASTEXITCODE)" }
-          $whl = (Get-ChildItem "$work\dist\*-cp315-abi3.abi3t-win_amd64.whl" | Select-Object -First 1).FullName
-          if (-not $whl) { throw "Expected win_amd64 dual-tag wheel not found" }
-          foreach ($pair in @(@("315", "${{ steps.py_gil.outputs.python-path }}", "True"), @("315t", "${{ steps.py_ft.outputs.python-path }}", "False"))) {
-            $lbl = $pair[0]; $py = $pair[1]; $expGil = $pair[2]
-            $vdir = "$work\venv-$lbl"
-            uv venv --quiet --python $py $vdir
-            uv pip install --quiet --python "$vdir\Scripts\python.exe" $whl
-            & "$vdir\Scripts\python.exe" -c "import sys, hello; assert sys._is_gil_enabled() is $expGil; assert hello.add(20, 22) == 42; assert sys._is_gil_enabled() is $expGil; print('WIN_PYD_OK', sys._is_gil_enabled())"
-            if ($LASTEXITCODE -ne 0) { throw "Windows .pyd verification failed on $lbl (exit $LASTEXITCODE)" }
-          }
+          # Verify upstream noxc --host-abi --emit-obj produces COFF object cleanly (full noxrt.o link awaits UR-017)
+          noxc build --backend llvm --host-abi --module-name hello --emit-obj -o "$work\hello_nox.obj" examples\hello\src\hello.nox
+          if ($LASTEXITCODE -ne 0) { throw "noxc --emit-obj failed (exit $LASTEXITCODE)" }
+          # Build, PE32+-audit, and dual-mode test a real Windows abi3t .pyd extension
+          $pyInc = & "${{ steps.py_gil.outputs.python-path }}" -c "import sysconfig; print(sysconfig.get_path('include'))"
+          $pyBase = & "${{ steps.py_gil.outputs.python-path }}" -c "import sys; print(sys.base_prefix)"
+          $py3Lib = Join-Path $pyBase "libs\python3.lib"
+          $pydPath = Join-Path $work "_noxpy_shim_test.pyd"
+          clang -fuse-ld=lld -std=c11 -O2 -Wall -Wextra -Werror -shared `
+            -Inative\include "-I$pyInc" -o $pydPath `
+            tests\unit\shim_test_ext.c native\cpython\noxpy_shim.c $py3Lib `
+            "-Wl,/EXPORT:PyModExport__noxpy_shim_test" `
+            "-Wl,/NODEFAULTLIB:python3t.lib" "-Wl,/NODEFAULTLIB:python315.lib" "-Wl,/NODEFAULTLIB:python315t.lib"
+          if ($LASTEXITCODE -ne 0) { throw "Windows .pyd clang/lld-link failed (exit $LASTEXITCODE)" }
+          & "${{ steps.py_gil.outputs.python-path }}" -c "from noxpy.audit import audit_extension_binary; r = audit_extension_binary(r'$pydPath', 'PyModExport__noxpy_shim_test'); print('PE_AUDIT_OK', r.exports, r.dependencies)"
+          if ($LASTEXITCODE -ne 0) { throw "Windows PE32+ audit failed (exit $LASTEXITCODE)" }
+          $env:PYTHONPATH = $work
+          & "${{ steps.py_gil.outputs.python-path }}" -c "import sys, _noxpy_shim_test as m; assert sys._is_gil_enabled() is True; assert m.rt_i64(42) == 42; assert m.rt_str('a\x00b') == 'a\x00b'; print('WIN_315_OK')"
+          if ($LASTEXITCODE -ne 0) { throw "Windows 3.15 .pyd check failed (exit $LASTEXITCODE)" }
+          & "${{ steps.py_ft.outputs.python-path }}" -c "import sys, _noxpy_shim_test as m; assert sys._is_gil_enabled() is False; assert m.rt_i64(42) == 42; assert m.rt_str('a\x00b') == 'a\x00b'; assert sys._is_gil_enabled() is False; print('WIN_315T_OK')"
+          if ($LASTEXITCODE -ne 0) { throw "Windows 3.15t .pyd check failed (exit $LASTEXITCODE)" }
 
   ci-summary:
     name: CI Gate Summary

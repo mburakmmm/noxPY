@@ -126,7 +126,7 @@
 - [x] Remove `PyGILState_Ensure()` fallback in `noxpy_interp_attach()` and add per-interpreter `atexit` shutdown barrier (`active_attaches` + `active_async_ops`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c), verified by [`tests/stress/test_phase7a_soak.py`](tests/stress/test_phase7a_soak.py).
 - [x] Verify real `NumPy` (`2.5.5`) + `PyArrow` (`26.0.1`, incl. `pa.chunked_array` C Stream) interop (`3.15` & `3.15t` NumPy + Arrow PyCapsule, with honest local `3.15.0b3t` `pyarrow.lib` import probe).
 - [x] Upgrade Universal Package Bindings v2 (`pkg_bridge.py`: `--portable`, `--repo-url`, `--multi-module`, nested modules, `/` & `*` parameter kinds, and automatic non-generic public class wrappers).
-- [x] Add pure-Python PE32+ Windows `.pyd` auditor ([`python/noxpy/audit.py`](python/noxpy/audit.py)), Windows `.pyd` linking & `NOXPY_PLATFORM_TAG` (`manylinux`) in [`python/noxpy/build.py`](python/noxpy/build.py), and upgrade [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+- [x] Add pure-Python PE32+ Windows `.pyd` auditor ([`python/noxpy/audit.py`](python/noxpy/audit.py)), Windows `.pyd` linking & `NOXPY_PLATFORM_TAG` (`manylinux`) in [`python/noxpy/build.py`](python/noxpy/build.py), and upgrade [`.github/workflows/ci.yml`](.github/workflows/ci.yml) (Windows `noxrt.o` link parity tracked in [`UR-017`](UPSTREAM_REQUIREMENTS.md)).
 
 ---
 

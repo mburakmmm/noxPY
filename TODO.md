@@ -77,17 +77,17 @@
 
 ---
 
-## Phase 3 — `0.3`: Native Objects & Classes (Unlocked — Next)
-- [ ] Implement CPython 3.15 heap types (`PyType_FromMetaclass` / `PyType_FromModuleAndSpec` / slots) with interpreter-local type objects (`ADR-005`).
-- [ ] Implement generation-checked opaque handle table (`UR-006`) rejecting cross-interpreter use, ABA wrap, and use-after-close.
-- [ ] Implement `@pyclass`, `@pymethod`, `@pyproperty`, `@pystaticmethod`, `@pyclassmethod`, `@pyexception`, constructors, `__repr__`, and rich comparisons (`NotImplemented`).
-- [ ] Enforce thread policies (`parallel`, `instance_locked`, `thread_affine`) and lock-order rules (`docs/architecture/threading.md`, `ADR-003`, `ADR-007`).
-- [ ] Implement GC `tp_traverse` / `tp_clear`, weakref/finalizer tests, context-manager (`close` idempotency), and mixed-cycle handling/rejection.
-- [ ] Ship `examples/classes` and `examples/parallel`; pass same-instance contention and distinct-instance overlap tests.
+## Phase 3 — `0.3`: Native Objects & Classes (Complete — `2026-11-26` on `noxc v2.2.90` + `CPython 3.15.2` & `3.15.0b3t`)
+- [x] Implement CPython 3.15 heap types (`PyType_FromModuleAndSpec` + `Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE` + PEP 697 negative `basicsize`) with interpreter-local type objects (`ADR-0005`).
+- [x] Implement generation-checked opaque handle table (`UR-006`, `NoxHostHandle` + dedicated `owner_ctx` + `noxpy_obj_new_from_handle`) rejecting cross-interpreter/foreign-context use and use-after-close.
+- [x] Implement `@export` native classes, methods, `@property` getters/setters, `@staticmethod`, `@classmethod`, custom `@export` exceptions (`PyErr_NewExceptionWithDoc` + `noxpy_set_exception_from_host_ex`), constructors, `__repr__`, `__str__`, `__len__`, and deterministic `.pyi` + `abi3t` C codegen (`python/noxpy/ir.py`, `python/noxpy/codegen.py`).
+- [x] Enforce thread policies (`parallel`, `instance_locked`, `thread_affine`) and lock-order rules (`docs/architecture/threading.md`, `ADR-0005`, `tests/unit/test_phase3_heap_types.py`).
+- [x] Implement GC `tp_traverse` / `tp_clear`, cyclic cleanup tests, context-manager (`close` idempotency, `__enter__`/`__exit__`), and unhashable/immutable checks.
+- [x] Ship [`examples/classes`](examples/classes/) and [`examples/parallel`](examples/parallel/); pass same-instance contention (`8x250 == 2000`) and distinct-instance overlap tests on `CPython 3.15.2` & unforced `3.15.0b3t` ([`tests/packaging/test_phase3_classes.py`](tests/packaging/test_phase3_classes.py), [`docs/evidence/phase3-2026-11-26.md`](docs/evidence/phase3-2026-11-26.md)).
 
 ---
 
-## Phase 4 — `0.4`: Callbacks, Async, and Isolation (Locked behind Phase 3)
+## Phase 4 — `0.4`: Callbacks, Async, and Isolation (Unlocked — Next; `UR-010` ready in `noxc v2.2.90`)
 - [ ] Implement managed `PyObject` handle abstraction (interpreter-affine, strong-ref tracked, never exposed as raw `PyObject*`).
 - [ ] Support synchronous reentrant callbacks and safe worker-thread callback routing with Python exception/traceback preservation.
 - [ ] Implement `src/async_bridge/` (`@pyasync`): genuine Python awaitables, loop-created Futures, exactly-once completion, cancellation & backpressure tests.

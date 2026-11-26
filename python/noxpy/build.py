@@ -522,7 +522,11 @@ def _compile_and_audit_extension(
 
         audit = audit_extension_binary(so_path, f"PyModExport_{cfg.leaf_name}")
         so_bytes = so_path.read_bytes()
-        exported_fns = tuple(fn.name for fn in ir.functions)
+        exported_fns = tuple(
+            [fn.name for fn in ir.functions]
+            + [cls.name for cls in ir.classes]
+            + [exc.name for exc in ir.exceptions]
+        )
 
     if use_cache:
         cache_root.mkdir(parents=True, exist_ok=True)

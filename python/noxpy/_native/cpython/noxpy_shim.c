@@ -404,6 +404,9 @@ static PyObject *pick_exc_type(NoxHostStatus status, NoxHostSpan class_name) {
         if (span_eq_cstr(class_name, "IndexError")) return PyExc_IndexError;
         if (span_eq_cstr(class_name, "KeyError")) return PyExc_KeyError;
         if (span_eq_cstr(class_name, "ZeroDivisionError")) return PyExc_ZeroDivisionError;
+        if (span_eq_cstr(class_name, "NotImplementedError")) return PyExc_NotImplementedError;
+        if (span_eq_cstr(class_name, "AssertionError")) return PyExc_AssertionError;
+        if (span_eq_cstr(class_name, "AttributeError")) return PyExc_AttributeError;
     }
     switch (status) {
         case NOX_HOST_ERR_NOMEM:
@@ -420,7 +423,12 @@ static PyObject *pick_exc_type(NoxHostStatus status, NoxHostSpan class_name) {
     }
 }
 
-void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status, NoxHostError *err) {
+void noxpy_set_exception_from_host_ex(
+    const NoxPyHostOps *ops,
+    NoxHostStatus status,
+    NoxHostError *err,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs) {
     NoxHostSpan class_name = {0};
     NoxHostSpan message = {0};
     int64_t line = 0;
@@ -437,7 +445,20 @@ void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status
         }
     }
 
-    PyObject *exc_type = pick_exc_type(status, class_name);
+    PyObject *exc_type = NULL;
+    if (custom_excs && n_custom_excs > 0 && class_name.data && class_name.len > 0) {
+        for (size_t i = 0; i < n_custom_excs; i++) {
+            if (custom_excs[i].name && custom_excs[i].exc_type &&
+                span_eq_cstr(class_name, custom_excs[i].name)) {
+                exc_type = custom_excs[i].exc_type;
+                break;
+            }
+        }
+    }
+    if (!exc_type) {
+        exc_type = pick_exc_type(status, class_name);
+    }
+
     if (message.data && message.len > 0) {
         int msg_len = message.len > (size_t)INT_MAX ? INT_MAX : (int)message.len;
         if (class_name.data && class_name.len > 0) {
@@ -468,6 +489,10 @@ void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status
     if (err && ops && ops->error_release) {
         ops->error_release(err);
     }
+}
+
+void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status, NoxHostError *err) {
+    noxpy_set_exception_from_host_ex(ops, status, err, NULL, 0);
 }
 
 int noxpy_bind_fastcall_kwargs(
@@ -554,6 +579,132 @@ int noxpy_bind_fastcall_kwargs(
             return -1;
         }
         bound_out[match] = args[nargs + k];
+    }
+
+    for (Py_ssize_t i = 0; i < nparams; i++) {
+        if (bound_out[i] == NULL && !specs[i].has_default) {
+            if (specs[i].kind == NOXPY_PARAM_KW_ONLY) {
+                PyErr_Format(PyExc_TypeError, "%s() missing required keyword-only argument: '%s'", fn_name, specs[i].name);
+            } else {
+                PyErr_Format(PyExc_TypeError, "%s() missing required argument: '%s'", fn_name, specs[i].name);
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int noxpy_bind_tuple_kwargs(
+    const char *fn_name,
+    const NoxPyParamSpec *specs,
+    Py_ssize_t nparams,
+    PyObject *args_tuple,
+    PyObject *kwds_dict,
+    PyObject **bound_out) {
+    if (!fn_name || (!specs && nparams > 0) || (!bound_out && nparams > 0) || !args_tuple) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid tuple/kwds argument binder state");
+        return -1;
+    }
+
+    Py_ssize_t max_pos = 0;
+    for (Py_ssize_t i = 0; i < nparams; i++) {
+        bound_out[i] = NULL;
+        if (specs[i].kind != NOXPY_PARAM_KW_ONLY) {
+            max_pos++;
+        }
+    }
+
+    Py_ssize_t nargs = PyTuple_Size(args_tuple);
+    if (nargs < 0) {
+        return -1;
+    }
+    if (nargs > max_pos) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "%s() takes %zd positional argument(s) but %zd were given",
+            fn_name,
+            max_pos,
+            nargs);
+        return -1;
+    }
+
+    for (Py_ssize_t i = 0; i < nargs; i++) {
+        bound_out[i] = PyTuple_GetItem(args_tuple, i);
+        if (!bound_out[i]) {
+            return -1;
+        }
+    }
+
+    if (kwds_dict) {
+        PyObject *items = PyDict_Items(kwds_dict);
+        if (!items) {
+            return -1;
+        }
+        Py_ssize_t nkw = PyList_Size(items);
+        if (nkw < 0) {
+            Py_DECREF(items);
+            return -1;
+        }
+        for (Py_ssize_t k = 0; k < nkw; k++) {
+            PyObject *pair = PySequence_GetItem(items, k);
+            if (!pair) {
+                Py_DECREF(items);
+                return -1;
+            }
+            PyObject *kw = PyTuple_GetItem(pair, 0);
+            PyObject *val = PyTuple_GetItem(pair, 1);
+            if (!kw || !val || !PyUnicode_Check(kw)) {
+                Py_DECREF(pair);
+                Py_DECREF(items);
+                PyErr_SetString(PyExc_TypeError, "keywords must be strings");
+                return -1;
+            }
+            Py_ssize_t match = -1;
+            for (Py_ssize_t i = 0; i < nparams; i++) {
+                int cmp = PyUnicode_CompareWithASCIIString(kw, specs[i].name);
+                if (cmp == 0) {
+                    match = i;
+                    break;
+                }
+                if (PyErr_Occurred()) {
+                    Py_DECREF(pair);
+                    Py_DECREF(items);
+                    return -1;
+                }
+            }
+            if (match < 0) {
+                Py_ssize_t kw_len = 0;
+                const char *kw_utf8 = PyUnicode_AsUTF8AndSize(kw, &kw_len);
+                if (kw_utf8) {
+                    int klen = kw_len > (Py_ssize_t)INT_MAX ? INT_MAX : (int)kw_len;
+                    PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument '%.*s'", fn_name, klen, kw_utf8);
+                } else {
+                    PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument", fn_name);
+                }
+                Py_DECREF(pair);
+                Py_DECREF(items);
+                return -1;
+            }
+            if (specs[match].kind == NOXPY_PARAM_POS_ONLY) {
+                PyErr_Format(
+                    PyExc_TypeError,
+                    "%s() got some positional-only arguments passed as keyword arguments: '%s'",
+                    fn_name,
+                    specs[match].name);
+                Py_DECREF(pair);
+                Py_DECREF(items);
+                return -1;
+            }
+            if (bound_out[match] != NULL) {
+                PyErr_Format(PyExc_TypeError, "%s() got multiple values for argument '%s'", fn_name, specs[match].name);
+                Py_DECREF(pair);
+                Py_DECREF(items);
+                return -1;
+            }
+            bound_out[match] = val;
+            Py_DECREF(pair);
+        }
+        Py_DECREF(items);
     }
 
     for (Py_ssize_t i = 0; i < nparams; i++) {
@@ -1534,6 +1685,70 @@ int noxpy_obj_init(
     data->closed = 0u;
     data->initialized = 1u;
     return 0;
+}
+
+PyObject *noxpy_obj_new_from_handle(
+    PyTypeObject *cls,
+    PyObject *owner_module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *owner_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy) {
+    if (!cls || !owner_module || !ops || !owner_ctx || handle == 0) {
+        if (handle != 0 && owner_ctx && ops && ops->handle_release) {
+            Py_BEGIN_ALLOW_THREADS
+            (void)ops->handle_release(owner_ctx, handle);
+            Py_END_ALLOW_THREADS
+        }
+        if (owner_ctx && ops) {
+            Py_BEGIN_ALLOW_THREADS
+            destroy_host_context(ops, owner_ctx);
+            Py_END_ALLOW_THREADS
+        }
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_new_from_handle");
+        return NULL;
+    }
+    allocfunc tp_alloc = (allocfunc)PyType_GetSlot(cls, Py_tp_alloc);
+    if (!tp_alloc) {
+        Py_BEGIN_ALLOW_THREADS
+        if (ops->handle_release) {
+            (void)ops->handle_release(owner_ctx, handle);
+        }
+        destroy_host_context(ops, owner_ctx);
+        Py_END_ALLOW_THREADS
+        PyErr_SetString(PyExc_SystemError, "noxpy: native type missing Py_tp_alloc slot");
+        return NULL;
+    }
+    PyObject *obj = tp_alloc(cls, 0);
+    if (!obj) {
+        Py_BEGIN_ALLOW_THREADS
+        if (ops->handle_release) {
+            (void)ops->handle_release(owner_ctx, handle);
+        }
+        destroy_host_context(ops, owner_ctx);
+        Py_END_ALLOW_THREADS
+        return NULL;
+    }
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(obj, cls);
+    if (!data || noxpy_obj_init(data, owner_module, ops, owner_ctx, handle, type_tag, thread_policy) < 0) {
+        if (data && data->initialized) {
+            noxpy_obj_close(data);
+        } else {
+            Py_BEGIN_ALLOW_THREADS
+            if (ops->handle_release) {
+                (void)ops->handle_release(owner_ctx, handle);
+            }
+            destroy_host_context(ops, owner_ctx);
+            Py_END_ALLOW_THREADS
+        }
+        Py_DECREF(obj);
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_SystemError, "noxpy: failed to initialize returned handle wrapper");
+        }
+        return NULL;
+    }
+    return obj;
 }
 
 int noxpy_obj_enter_call(

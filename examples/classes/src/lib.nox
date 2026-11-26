@@ -1,0 +1,69 @@
+@export
+class CounterError(ValueError):
+    """Domain error raised by native Counter operations."""
+    pass
+
+
+@export("instance_locked")
+class Counter:
+    """Thread-safe mutable native counter."""
+    value_slot: int
+
+    def __init__(self, start: int = 0) -> None:
+        if start < 0:
+            raise CounterError("start must be non-negative")
+        self.value_slot = start
+
+    def inc(self, delta: int = 1) -> int:
+        if self.value_slot + delta < 0:
+            raise CounterError("counter cannot become negative")
+        self.value_slot = self.value_slot + delta
+        return self.value_slot
+
+    @property
+    def value(self) -> int:
+        return self.value_slot
+
+    @value.setter
+    def value(self, v: int) -> None:
+        if v < 0:
+            raise CounterError("value must be non-negative")
+        self.value_slot = v
+
+    @staticmethod
+    def zero() -> int:
+        return 0
+
+    @classmethod
+    def make(cls, start: int) -> Counter:
+        return Counter(start)
+
+    def __repr__(self) -> str:
+        return "Counter(" + str(self.value_slot) + ")"
+
+    def __str__(self) -> str:
+        return "count=" + str(self.value_slot)
+
+    def __len__(self) -> int:
+        return self.value_slot
+
+
+@export("thread_affine")
+class AffineBox:
+    """Thread-affine native state container."""
+    val: int
+
+    def __init__(self, v: int) -> None:
+        self.val = v
+
+    def get(self) -> int:
+        return self.val
+
+    def set_val(self, v: int) -> None:
+        self.val = v
+
+
+@export
+def make_counter(start: int = 0) -> Counter:
+    """Construct a Counter from a top-level factory function."""
+    return Counter(start)

@@ -80,6 +80,7 @@ typedef struct NoxPyHostOps {
     NoxHostStatus (*handle_retain)(NoxHostContext *ctx, NoxHostHandle h, NoxHostHandle *out);
     NoxHostStatus (*handle_release)(NoxHostContext *ctx, NoxHostHandle h);
     int32_t (*handle_is_valid)(NoxHostContext *ctx, NoxHostHandle h);
+    NoxHostStatus (*handle_type_name)(NoxHostContext *ctx, NoxHostHandle h, NoxHostSpan *out);
 } NoxPyHostOps;
 
 /*
@@ -152,11 +153,22 @@ int noxpy_py_to_bytes_span_strict(PyObject *obj, NoxHostSpan *out, const char *a
 PyObject *noxpy_bytes_span_to_py(NoxHostSpan span);
 PyObject *noxpy_bytes_buffer_to_py(const NoxPyHostOps *ops, NoxHostBuffer *buf);
 
+typedef struct NoxPyCustomExc {
+    const char *name;
+    PyObject *exc_type;
+} NoxPyCustomExc;
+
 /*
  * Map NoxHostStatus + optional NoxHostError to a Python exception and ALWAYS release `err`.
  * Must be called while the owning `ctx` is still alive.
  */
 void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status, NoxHostError *err);
+void noxpy_set_exception_from_host_ex(
+    const NoxPyHostOps *ops,
+    NoxHostStatus status,
+    NoxHostError *err,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs);
 
 #define NOXPY_PARAM_POS_ONLY 0u
 #define NOXPY_PARAM_POS_OR_KW 1u
@@ -180,6 +192,14 @@ int noxpy_bind_fastcall_kwargs(
     PyObject *const *args,
     Py_ssize_t nargs,
     PyObject *kwnames,
+    PyObject **bound_out);
+
+int noxpy_bind_tuple_kwargs(
+    const char *fn_name,
+    const NoxPyParamSpec *specs,
+    Py_ssize_t nparams,
+    PyObject *args_tuple,
+    PyObject *kwds_dict,
     PyObject **bound_out);
 
 /*
@@ -254,6 +274,14 @@ void noxpy_host_context_fini_and_destroy(const NoxPyHostOps *ops, NoxHostContext
 
 int noxpy_obj_init(
     NoxPyObjectData *data,
+    PyObject *owner_module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *owner_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy);
+PyObject *noxpy_obj_new_from_handle(
+    PyTypeObject *cls,
     PyObject *owner_module,
     const NoxPyHostOps *ops,
     NoxHostContext *owner_ctx,

@@ -1,0 +1,38 @@
+@export("parallel")
+class Worker:
+    """Independent parallel native compute worker."""
+    seed: int
+
+    def __init__(self, seed: int = 0) -> None:
+        self.seed = seed
+
+    def compute(self, iters: int) -> int:
+        acc: int = self.seed
+        i: int = 0
+        while i < iters:
+            acc = acc + ((i * 7 + 3) % 13)
+            i += 1
+        return acc
+
+    def sum_vec(self, xs: list[int]) -> int:
+        acc: int = self.seed
+        for x in xs:
+            acc = acc + x
+        return acc
+
+
+@export("instance_locked")
+class Accumulator:
+    """Contended mutable accumulator guarded by instance mutex."""
+    total_val: int
+
+    def __init__(self, start: int = 0) -> None:
+        self.total_val = start
+
+    def add(self, delta: int = 1) -> int:
+        self.total_val = self.total_val + delta
+        return self.total_val
+
+    @property
+    def total(self) -> int:
+        return self.total_val

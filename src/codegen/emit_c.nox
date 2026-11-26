@@ -435,6 +435,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
         "    .handle_retain = nox_host_handle_retain,",
         "    .handle_release = nox_host_handle_release,",
         "    .handle_is_valid = nox_host_handle_is_valid,",
+        "    .handle_type_name = nox_host_handle_type_name,",
         "};",
         "",
     ]

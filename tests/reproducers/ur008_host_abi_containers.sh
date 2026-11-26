@@ -31,10 +31,17 @@ echo "[UR-008] Using noxc: $NOXC ($NOXC_VER)"
 
 EXPAND_OUT="$("$NOXC" expand --json --module p2_probe "$TMPD/p2_probe.nox")"
 
-if [ -f "$NOX_INCLUDE/nox_host.h" ] && grep -q "NOX_HOST_ABI_VERSION 2u" "$NOX_INCLUDE/nox_host.h"; then
+if [ -f "$NOX_INCLUDE/nox_host.h" ] && grep -Eq "NOX_HOST_ABI_VERSION [23]u" "$NOX_INCLUDE/nox_host.h"; then
     echo "$EXPAND_OUT" | grep -q '"tuple\[int, str\]"' || { echo "[UR-008] FAIL: missing canonical tuple[int, str]"; exit 1; }
     echo "$EXPAND_OUT" | grep -q '"marshal": "value"' || { echo "[UR-008] FAIL: missing marshal=value"; exit 1; }
     echo "$EXPAND_OUT" | grep -q '"default": {"type": "float", "value": 1.5}' || { echo "[UR-008] FAIL: missing constant default JSON"; exit 1; }
+    # UR-014 (v2.2.93+): `b"..."` constant defaults are accepted and reported as hex.
+    printf '@export\ndef framed(payload: bytes = b"\\x00\\x01ab") -> int:\n    return len(payload)\n' > "$TMPD/bytes_default.nox"
+    if "$NOXC" expand --json --module bd "$TMPD/bytes_default.nox" 2>/dev/null | grep -q '"hex": "00016162"'; then
+        echo "[UR-008] bytes default literal: OK (UR-014)"
+    else
+        echo "[UR-008] note: this noxc predates UR-014 (b\"...\" defaults not accepted yet)"
+    fi
     "$NOXC" build --backend llvm --host-abi --module-name p2_probe --emit-obj -o "$TMPD/p2.o" "$TMPD/p2_probe.nox" >/dev/null
     "$NOXC" build --backend llvm --host-abi --module-name p2_probe --emit-shared-lib -o "$TMPD/libp2.dylib" "$TMPD/p2_probe.nox" >/dev/null 2>&1 || \
         "$NOXC" build --backend llvm --host-abi --module-name p2_probe --emit-shared-lib -o "$TMPD/libp2.so" "$TMPD/p2_probe.nox" >/dev/null

@@ -138,6 +138,88 @@ class TestIR(unittest.TestCase):
             parse_upstream_metadata_json(bad)
         self.assertEqual(ctx.exception.code, "NPY-E-TYPE")
 
+    def test_accepts_and_validates_phase3_classes_and_exceptions(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "compiler": {"name": "noxc", "version": "2.2.90", "commit": "e297c4cf"},
+            "module": {"name": "pkg._p3", "source": "src/p3.nox"},
+            "exports": [
+                {
+                    "kind": "exception",
+                    "id": "pkg::CounterError",
+                    "name": "CounterError",
+                    "base": "ValueError",
+                    "doc": "Domain failure.",
+                    "span": {"file": "src/p3.nox", "line": 1, "column": 1},
+                },
+                {
+                    "kind": "class",
+                    "id": "pkg::Counter",
+                    "name": "Counter",
+                    "doc": "Native counter.",
+                    "thread_policy": "instance_locked",
+                    "span": {"file": "src/p3.nox", "line": 5, "column": 1},
+                    "constructor": {
+                        "c_symbol": "nox_host_export_pkg_Counter___new__",
+                        "params": [
+                            {
+                                "name": "start",
+                                "type": "int",
+                                "marshal": "scalar",
+                                "has_default": True,
+                                "default": {"type": "int", "value": 0},
+                            }
+                        ],
+                        "doc": None,
+                    },
+                    "methods": [
+                        {
+                            "name": "value",
+                            "method_kind": "property_get",
+                            "has_self": True,
+                            "c_symbol": "nox_host_export_pkg_Counter_get_value",
+                            "thread_policy": "instance_locked",
+                            "is_async": False,
+                            "params": [],
+                            "return_marshal": "scalar",
+                            "return_type": "int",
+                            "doc": None,
+                            "span": {"file": "src/p3.nox", "line": 10, "column": 1},
+                        },
+                        {
+                            "name": "value",
+                            "method_kind": "property_set",
+                            "has_self": True,
+                            "c_symbol": "nox_host_export_pkg_Counter_set_value",
+                            "thread_policy": "instance_locked",
+                            "is_async": False,
+                            "params": [{"name": "v", "type": "int", "marshal": "scalar", "has_default": False}],
+                            "return_marshal": "none",
+                            "return_type": "None",
+                            "doc": None,
+                            "span": {"file": "src/p3.nox", "line": 14, "column": 1},
+                        },
+                    ],
+                },
+            ],
+        }
+        ir = parse_upstream_metadata_json(manifest, expected_module_name="pkg._p3")
+        self.assertEqual([e.name for e in ir.exceptions], ["CounterError"])
+        self.assertEqual([c.name for c in ir.classes], ["Counter"])
+        self.assertEqual([m.method_kind for m in ir.classes[0].methods], ["property_get", "property_set"])
+
+        bad_setter = copy.deepcopy(manifest)
+        bad_setter["exports"][1]["methods"] = [bad_setter["exports"][1]["methods"][1]]  # type: ignore[index]
+        with self.assertRaises(NoxPyError) as ctx_s:
+            parse_upstream_metadata_json(bad_setter)
+        self.assertEqual(ctx_s.exception.code, "NPY-E-TYPE")
+
+        bad_async = copy.deepcopy(manifest)
+        bad_async["exports"][1]["methods"][0]["is_async"] = True  # type: ignore[index]
+        with self.assertRaises(NoxPyError) as ctx_a:
+            parse_upstream_metadata_json(bad_async)
+        self.assertEqual(ctx_a.exception.code, "NPY-E-TYPE")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.3.0a1] — 2026-11-26 (Phase 3 Alpha: Native Classes, Properties, Exceptions & Concurrency)
+
+### Added (Phase 3 — `noxc v2.2.90` & Host ABI `v3-rc`)
+- Synchronized [`native/include/nox_host.h`](native/include/nox_host.h) to upstream `NOX_HOST_ABI_VERSION = 3u` (`v2.2.90`, `UR-009` + `UR-010`), adding `nox_host_handle_type_name`, `NOX_HOST_VALUE_HANDLE`, and `NoxHostCallbackOps` declarations.
+- Extended [`native/include/noxpy_abi.h`](native/include/noxpy_abi.h) and [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) with interpreter-local `abi3t` heap-type handle runtime (`NoxPyObjectData`, `noxpy_obj_init`, `noxpy_obj_new_from_handle`, GC `tp_traverse`/`tp_clear`/`tp_dealloc`, idempotent `close()`/`__enter__`/`__exit__`, GIL-safe `pthread_mutex_lock`), `noxpy_bind_tuple_kwargs`, and custom exception lookup (`noxpy_set_exception_from_host_ex`).
+- Extended Binding IR ([`python/noxpy/ir.py`](python/noxpy/ir.py)) and deterministic `.pyi` + C codegen ([`python/noxpy/codegen.py`](python/noxpy/codegen.py)) to automatically emit CPython 3.15 `abi3t` wrapper types for `@export` classes, constructors, instance methods, `@property` getters/setters, `@staticmethod`, `@classmethod`, `__repr__`, `__str__`, `__len__`, top-level/`classmethod` handle factories, and `@export` custom exception subclasses.
+- Added runnable Phase 3 example packages [`examples/classes/`](examples/classes/) (`Counter`, `CounterError`, `AffineBox`, `make_counter`) and [`examples/parallel/`](examples/parallel/) (`Worker`, `Accumulator`), verified end-to-end across isolated `CPython 3.15` and unforced `CPython 3.15t` virtualenvs ([`tests/packaging/test_phase3_classes.py`](tests/packaging/test_phase3_classes.py), [`docs/evidence/phase3-2026-11-26.md`](docs/evidence/phase3-2026-11-26.md)).
+- Upgraded GitHub Actions CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) to install SHA-256-verified `nox-lang v2.2.90` on Linux & macOS, execute ASan/UBSan shim checks, and gate PRs/pushes on real `noxc` wheels + Phase 1/2/3 dual-mode suites (`NOXPY_REQUIRE_NATIVE=1`).
+
 ### Added (Phase 2 — Types, Containers, Defaults, & Packaging Complete on `noxc v2.2.87`)
 - Integrated upstream [`native/include/nox_host.h`](native/include/nox_host.h) ABI v2 (`NOX_HOST_ABI_VERSION = 2u`, `NoxHostValue`), backward-compatible with v1 (`experiments/phase0_poc`), resolving [`UR-008`](UPSTREAM_REQUIREMENTS.md) ([`tests/reproducers/ur008_host_abi_containers.sh`](tests/reproducers/ur008_host_abi_containers.sh)).
 - Recursive CPython 3.15 `abi3t` `NoxHostValue` converters (`noxpy_py_to_host_value`, `noxpy_host_value_to_py`), `NoxPyParamSpec.has_default`, atomic snapshots (`PySequence_Tuple`, `PyDict_Items`), cycle detection, and nesting depth caps (`NOXPY_MAX_CONV_DEPTH = 32`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) + `_native/` sync, audited cleanly via [`python/noxpy/audit.py`](python/noxpy/audit.py).

@@ -146,7 +146,7 @@ jobs:
           path: build_ci/_noxpy_shim_test.abi3t.so
 
   native-nox-end-to-end:
-    name: Native Nox Toolchain E2E (${{ matrix.os }} / v2.2.87)
+    name: Native Nox Toolchain E2E (${{ matrix.os }} / v2.2.90)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -164,20 +164,20 @@ jobs:
         with:
           python-version: "3.15t"
           allow-prereleases: true
-      - name: Install SHA-256 verified nox-lang v2.2.87
+      - name: Install SHA-256 verified nox-lang v2.2.90
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.nox-lang" /tmp/nox-dl
           if [ "${{ runner.os }}" = "macOS" ]; then
-            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.87/nox-lang-v2.2.87-macos-arm64.tar.gz"
-            SHA="4973b066c0685c09fbececaea69939ad17e0daa5af5d76c4dcab7a00efafbaeb"
+            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.90/nox-lang-v2.2.90-macos-arm64.tar.gz"
+            SHA="fbe12a834fd84e29172b7ecfd1a233d73476545cbba6e1a04785b6c2a97b314d"
             TAR="/tmp/nox-dl/nox.tar.gz"
             curl -fsSL "$URL" -o "$TAR"
             echo "$SHA  $TAR" | shasum -a 256 -c -
           else
-            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.87/nox-lang-v2.2.87-linux-x64.tar.gz"
-            SHA="f57576d69e456bd0bb4e4e2b327caa6ef0378e5162a7079555836169fbd087f2"
+            URL="https://github.com/mburakmmm/nox-lang/releases/download/v2.2.90/nox-lang-v2.2.90-linux-x64.tar.gz"
+            SHA="247970ab4a46c0194925b0898b012750d9bc53ddab819e143c7f74b6bd1756df"
             TAR="/tmp/nox-dl/nox.tar.gz"
             curl -fsSL "$URL" -o "$TAR"
             echo "$SHA  $TAR" | sha256sum -c -
@@ -188,7 +188,7 @@ jobs:
       - name: Install uv
         run: |
           "${{ steps.py_gil.outputs.python-path }}" -m pip install --quiet uv
-      - name: Run Nox language tests, fuzz, Phase 3A heap types, and Phase 1/2 real wheels
+      - name: Run Nox language tests, fuzz, Phase 3A heap types, and Phase 1/2/3 real wheels
         env:
           NOXPY_REQUIRE_NATIVE: "1"
           NOXPY_PYTHON_315T: ${{ steps.py_ft.outputs.python-path }}
@@ -196,7 +196,7 @@ jobs:
           noxc test tests/nox
           "${{ steps.py_gil.outputs.python-path }}" -m unittest discover -s tests/fuzz -v
           "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/unit/test_phase3_heap_types.py -v
-          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/packaging/test_phase1_wheels.py tests/packaging/test_phase2_packaging.py -v
+          "${{ steps.py_gil.outputs.python-path }}" -m unittest tests/packaging/test_phase1_wheels.py tests/packaging/test_phase2_packaging.py tests/packaging/test_phase3_classes.py -v
 
   ci-summary:
     name: CI Gate Summary

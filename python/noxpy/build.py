@@ -313,11 +313,10 @@ def _compile_and_audit_extension(
     release: bool,
     use_cache: bool,
 ) -> tuple[bytes, str | None, tuple[str, ...], AuditResult, str, str, str, bool]:
-    if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
-        raise NoxPyError("NPY-E-CONFIG", f"Extension linking not yet implemented on {sys.platform}")
-
     native_root = _find_native_root()
     noxc_p, noxrt_p, nox_inc, noxc_ver, noxc_sha, noxrt_sha = _find_nox_toolchain()
+    if sys.platform not in ("darwin",) and not sys.platform.startswith("linux"):
+        raise NoxPyError("NPY-E-CONFIG", f"Extension linking not yet implemented on {sys.platform}")
     lock_digest = compute_lock_digest(proj_root)
     plat_tag = compute_platform_tag()
 

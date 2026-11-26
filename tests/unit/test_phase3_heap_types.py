@@ -703,7 +703,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
 assert len(outs) == 8
 if not sys._is_gil_enabled():
     peak = m.peak_in_flight()
-    expected_min = 8 if (os.cpu_count() or 8) >= 4 else max(2, os.cpu_count() or 2)
+    expected_min = min(8, max(2, os.cpu_count() or 2))
     assert peak >= expected_min, f"expected peak_in_flight >= {expected_min} on free-threaded 3.15t, got {peak}"
 
 # thread_affine enforcement

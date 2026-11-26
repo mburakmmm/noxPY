@@ -1,0 +1,172 @@
+from nox.host import HostObject, HostArgs, HostResult, HostError
+from nox.time import sleep_ms
+
+
+@export
+class CallbackDemoError(ValueError):
+    pass
+
+
+@export
+def double_val(x: int) -> int:
+    return x * 2
+
+
+@export
+def apply_twice(cb: HostObject, x: int) -> int:
+    a: HostArgs = HostArgs()
+    a.add_int(x)
+    r: HostResult = cb.call(a)
+    b: HostArgs = HostArgs()
+    b.add_int(r.as_int())
+    return cb.call(b).as_int()
+
+
+@export
+def try_call(cb: HostObject) -> str:
+    try:
+        cb.call0()
+    except HostError as e:
+        return "caught: " + e.message
+    return "no error"
+
+
+@export
+def call_uncaught(cb: HostObject) -> int:
+    return cb.call0().as_int()
+
+
+@export
+def passthrough(cb: HostObject) -> HostObject:
+    return cb
+
+
+@export
+def call_all(cbs: list[HostObject], x: int) -> list[int]:
+    out: list[int] = []
+    for cb in cbs:
+        a: HostArgs = HostArgs()
+        a.add_int(x)
+        out.append(cb.call(a).as_int())
+    return out
+
+
+@export
+def maybe_call(cb: HostObject | None = None) -> int:
+    if cb is None:
+        return -1
+    return cb.call0().as_int()
+
+
+@export
+async def async_add(a: int, b: int, ms: int) -> int:
+    sleep_ms(ms)
+    return a + b
+
+
+@export
+async def async_greet(name: str, ms: int) -> str:
+    sleep_ms(ms)
+    return "Hello, " + name + "!"
+
+
+@export
+async def async_boom(ms: int) -> int:
+    sleep_ms(ms)
+    raise CallbackDemoError("async boom")
+
+
+@export
+async def async_nothing(ms: int) -> None:
+    sleep_ms(ms)
+
+
+@export
+async def async_slow(ms: int) -> int:
+    sleep_ms(ms)
+    return 1
+
+
+@export
+async def async_stuck() -> int:
+    ch: Channel[int] = Channel[int](0)
+    return await ch.recv()
+
+
+@export
+async def async_with_cb(cb: HostObject, x: int, ms: int) -> int:
+    sleep_ms(ms)
+    a: HostArgs = HostArgs()
+    a.add_int(x)
+    return cb.call(a).as_int()
+
+
+@export("instance_locked")
+class AsyncWorker:
+    base: int
+
+    def __init__(self, base: int) -> None:
+        self.base = base
+
+    def get_base(self) -> int:
+        return self.base
+
+    async def later(self, delta: int, ms: int) -> int:
+        sleep_ms(ms)
+        return self.base + delta
+
+
+@export
+async def make_worker_async(base: int, ms: int) -> AsyncWorker:
+    sleep_ms(ms)
+    return AsyncWorker(base)
+
+
+@export("instance_locked")
+class RangeIter:
+    cur: int
+    end: int
+
+    def __init__(self, start: int, end: int) -> None:
+        self.cur = start
+        self.end = end
+
+    def __iter__(self) -> RangeIter:
+        return self
+
+    def __next__(self) -> int:
+        if self.cur >= self.end:
+            raise StopIteration("done")
+        v: int = self.cur
+        self.cur = self.cur + 1
+        return v
+
+
+@export("instance_locked")
+class RangeSeq:
+    start: int
+    end: int
+
+    def __init__(self, start: int, end: int) -> None:
+        self.start = start
+        self.end = end
+
+    def __iter__(self) -> RangeIter:
+        return RangeIter(self.start, self.end)
+
+
+@export("instance_locked")
+class FailingIter:
+    count: int
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def __iter__(self) -> FailingIter:
+        return self
+
+    def __next__(self) -> int:
+        if self.count > 0:
+            raise CallbackDemoError("iter boom")
+        self.count = self.count + 1
+        return 99

@@ -87,12 +87,12 @@
 
 ---
 
-## Phase 4 — `0.4`: Callbacks, Async, and Isolation (Unlocked — Next; `UR-010` ready in `noxc v2.2.90`)
-- [ ] Implement managed `PyObject` handle abstraction (interpreter-affine, strong-ref tracked, never exposed as raw `PyObject*`).
-- [ ] Support synchronous reentrant callbacks and safe worker-thread callback routing with Python exception/traceback preservation.
-- [ ] Implement `src/async_bridge/` (`@pyasync`): genuine Python awaitables, loop-created Futures, exactly-once completion, cancellation & backpressure tests.
-- [ ] Implement `@pyiterator` protocol with owner lifetime preservation and `StopIteration` vs error distinction.
-- [ ] Prove subinterpreter isolation (`Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` or `SUPPORTED`), cross-interpreter rejection, and clean teardown.
+## Phase 4 — `0.4`: Callbacks, Async, and Isolation (Core Verified on `noxc v2.2.92`; Subinterpreter Pending `v2.2.93`)
+- [x] Implement managed `PyObject` handle abstraction (`NoxPyExtRefTable` + `NoxHostExternalRef`, interpreter-affine, generation-checked, strong-ref tracked, never exposed as raw `PyObject*`).
+- [x] Support synchronous reentrant callbacks and safe worker-thread callback routing (`PyGILState_Ensure`, `NoxHostCallbackOps`, original Python exception restoration across `NOX_HOST_ERR_HOST_EXCEPTION`).
+- [x] Implement `asyncio.Future` async bridge (`@export async def` + `async` class methods, `loop.call_soon_threadsafe` completion, cooperative cancellation, deadlock `RuntimeError` containment, deferred instance close).
+- [x] Implement iterator protocol (`__iter__` / `__next__`, `NoxPySharedCtx` lifetime preservation, clean `StopIteration` vs domain exception distinction).
+- [ ] Prove subinterpreter isolation (`Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` or `SUPPORTED`), cross-interpreter rejection, and clean teardown (blocked until `nox-lang v2.2.93` `UR-013` ships in CI/toolchain).
 
 ---
 

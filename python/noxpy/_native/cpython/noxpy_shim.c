@@ -23,6 +23,400 @@ static void pool_lock_release(atomic_flag *flag) {
     atomic_flag_clear_explicit(flag, memory_order_release);
 }
 
+typedef struct NoxPyExtRefSlot {
+    PyObject *obj;
+    char *err_msg;
+    uint64_t ref_count;
+    uint32_t generation;
+    uint8_t in_use;
+} NoxPyExtRefSlot;
+
+struct NoxPyExtRefTable {
+    pthread_mutex_t mu;
+    _Atomic uint64_t table_refs;
+    const NoxPyHostOps *host_ops;
+    NoxPyExtRefSlot *slots;
+    size_t cap;
+    uint32_t next_gen;
+    NoxHostCallbackOps cb_ops;
+};
+
+static PyObject *hv_to_py_rec(
+    const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
+    NoxHostContext *ctx,
+    NoxHostValue val,
+    size_t depth);
+
+static int py_dynamic_to_hv_rec(
+    const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
+    NoxHostContext *ctx,
+    PyObject *obj,
+    NoxPyConvGuard *g,
+    NoxHostValue *out_val,
+    const char *label);
+
+static NoxPyExtRefTable *extref_table_retain(NoxPyExtRefTable *tbl) {
+    if (tbl) {
+        atomic_fetch_add_explicit(&tbl->table_refs, 1, memory_order_relaxed);
+    }
+    return tbl;
+}
+
+static void extref_table_clear_slots(NoxPyExtRefTable *tbl, int release_gil) {
+    if (!tbl) {
+        return;
+    }
+    pthread_mutex_lock(&tbl->mu);
+    NoxPyExtRefSlot *old_slots = tbl->slots;
+    size_t old_cap = tbl->cap;
+    tbl->slots = NULL;
+    tbl->cap = 0;
+    pthread_mutex_unlock(&tbl->mu);
+
+    if (!old_slots) {
+        return;
+    }
+    for (size_t i = 0; i < old_cap; i++) {
+        free(old_slots[i].err_msg);
+        old_slots[i].err_msg = NULL;
+        if (old_slots[i].obj) {
+            PyObject *dead = old_slots[i].obj;
+            old_slots[i].obj = NULL;
+            if (release_gil) {
+                PyGILState_STATE gs = PyGILState_Ensure();
+                Py_DECREF(dead);
+                PyGILState_Release(gs);
+            } else {
+                Py_DECREF(dead);
+            }
+        }
+    }
+    free(old_slots);
+}
+
+static void extref_table_release(NoxPyExtRefTable *tbl) {
+    if (!tbl) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&tbl->table_refs, 1, memory_order_acq_rel) == 1) {
+        extref_table_clear_slots(tbl, 1);
+        pthread_mutex_destroy(&tbl->mu);
+        free(tbl);
+    }
+}
+
+static uint32_t extref_decode_idx(NoxHostExternalRef ref, uint32_t *out_gen) {
+    uint32_t low = (uint32_t)(ref & 0xFFFFFFFFULL);
+    *out_gen = (uint32_t)(ref >> 32);
+    if (low == 0 || *out_gen == 0) {
+        return UINT32_MAX;
+    }
+    return low - 1u;
+}
+
+static NoxHostExternalRef extref_intern_obj_with_msg(
+    NoxPyExtRefTable *tbl,
+    PyObject *obj,
+    const char *msg_copy,
+    const char **out_msg_ptr,
+    size_t *out_msg_len) {
+    if (out_msg_ptr) {
+        *out_msg_ptr = NULL;
+    }
+    if (out_msg_len) {
+        *out_msg_len = 0;
+    }
+    if (!tbl || !obj) {
+        return 0;
+    }
+    char *dup_msg = NULL;
+    size_t dup_len = 0;
+    if (msg_copy) {
+        dup_len = strlen(msg_copy);
+        dup_msg = (char *)malloc(dup_len + 1);
+        if (dup_msg) {
+            memcpy(dup_msg, msg_copy, dup_len + 1);
+        } else {
+            dup_len = 0;
+        }
+    }
+
+    Py_INCREF(obj);
+    pthread_mutex_lock(&tbl->mu);
+    size_t slot_idx = SIZE_MAX;
+    for (size_t i = 0; i < tbl->cap; i++) {
+        if (!tbl->slots[i].in_use) {
+            slot_idx = i;
+            break;
+        }
+    }
+    if (slot_idx == SIZE_MAX) {
+        size_t new_cap = tbl->cap == 0 ? 16 : tbl->cap * 2;
+        if (new_cap > (size_t)UINT32_MAX - 1u) {
+            pthread_mutex_unlock(&tbl->mu);
+            free(dup_msg);
+            Py_DECREF(obj);
+            return 0;
+        }
+        NoxPyExtRefSlot *new_slots = (NoxPyExtRefSlot *)realloc(tbl->slots, new_cap * sizeof(NoxPyExtRefSlot));
+        if (!new_slots) {
+            pthread_mutex_unlock(&tbl->mu);
+            free(dup_msg);
+            Py_DECREF(obj);
+            return 0;
+        }
+        for (size_t i = tbl->cap; i < new_cap; i++) {
+            memset(&new_slots[i], 0, sizeof(NoxPyExtRefSlot));
+        }
+        slot_idx = tbl->cap;
+        tbl->slots = new_slots;
+        tbl->cap = new_cap;
+    }
+
+    uint32_t gen = tbl->next_gen++;
+    if (gen == 0) {
+        gen = tbl->next_gen++;
+    }
+    tbl->slots[slot_idx].obj = obj;
+    tbl->slots[slot_idx].err_msg = dup_msg;
+    tbl->slots[slot_idx].ref_count = 1;
+    tbl->slots[slot_idx].generation = gen;
+    tbl->slots[slot_idx].in_use = 1u;
+    if (out_msg_ptr && dup_msg) {
+        *out_msg_ptr = dup_msg;
+        if (out_msg_len) {
+            *out_msg_len = dup_len;
+        }
+    }
+    pthread_mutex_unlock(&tbl->mu);
+
+    return (((uint64_t)gen) << 32) | ((uint64_t)(slot_idx + 1u));
+}
+
+static void extref_retain_token(NoxPyExtRefTable *tbl, NoxHostExternalRef ref) {
+    if (!tbl || ref == 0) {
+        return;
+    }
+    uint32_t gen = 0;
+    uint32_t idx = extref_decode_idx(ref, &gen);
+    if (idx == UINT32_MAX) {
+        return;
+    }
+    pthread_mutex_lock(&tbl->mu);
+    if ((size_t)idx < tbl->cap && tbl->slots[idx].in_use && tbl->slots[idx].generation == gen &&
+        tbl->slots[idx].ref_count > 0) {
+        tbl->slots[idx].ref_count++;
+    }
+    pthread_mutex_unlock(&tbl->mu);
+}
+
+static void extref_release_token(NoxPyExtRefTable *tbl, NoxHostExternalRef ref) {
+    if (!tbl || ref == 0) {
+        return;
+    }
+    uint32_t gen = 0;
+    uint32_t idx = extref_decode_idx(ref, &gen);
+    if (idx == UINT32_MAX) {
+        return;
+    }
+    PyObject *dead_obj = NULL;
+    char *dead_msg = NULL;
+    pthread_mutex_lock(&tbl->mu);
+    if ((size_t)idx < tbl->cap && tbl->slots[idx].in_use && tbl->slots[idx].generation == gen &&
+        tbl->slots[idx].ref_count > 0) {
+        tbl->slots[idx].ref_count--;
+        if (tbl->slots[idx].ref_count == 0) {
+            dead_obj = tbl->slots[idx].obj;
+            dead_msg = tbl->slots[idx].err_msg;
+            memset(&tbl->slots[idx], 0, sizeof(NoxPyExtRefSlot));
+        }
+    }
+    pthread_mutex_unlock(&tbl->mu);
+
+    free(dead_msg);
+    if (dead_obj) {
+        PyGILState_STATE gs = PyGILState_Ensure();
+        Py_DECREF(dead_obj);
+        PyGILState_Release(gs);
+    }
+}
+
+static PyObject *extref_borrow_newref(NoxPyExtRefTable *tbl, NoxHostExternalRef ref) {
+    if (!tbl || ref == 0) {
+        return NULL;
+    }
+    uint32_t gen = 0;
+    uint32_t idx = extref_decode_idx(ref, &gen);
+    if (idx == UINT32_MAX) {
+        return NULL;
+    }
+    PyObject *pinned = NULL;
+    pthread_mutex_lock(&tbl->mu);
+    if ((size_t)idx < tbl->cap && tbl->slots[idx].in_use && tbl->slots[idx].generation == gen &&
+        tbl->slots[idx].ref_count > 0 && tbl->slots[idx].obj != NULL) {
+        tbl->slots[idx].ref_count++;
+        pinned = tbl->slots[idx].obj;
+    }
+    pthread_mutex_unlock(&tbl->mu);
+    if (!pinned) {
+        return NULL;
+    }
+    Py_INCREF(pinned);
+    extref_release_token(tbl, ref);
+    return pinned;
+}
+
+static NoxHostStatus capture_py_exc_to_host(
+    NoxPyExtRefTable *tbl,
+    uint64_t *out_err_token,
+    NoxHostBuffer *out_err_msg) {
+    if (out_err_token) {
+        *out_err_token = 0;
+    }
+    if (out_err_msg) {
+        out_err_msg->data = NULL;
+        out_err_msg->len = 0;
+    }
+    PyObject *exc = PyErr_GetRaisedException();
+    if (!exc) {
+        return NOX_HOST_ERR_HOST_EXCEPTION;
+    }
+    PyObject *s = PyObject_Str(exc);
+    const char *msg_cstr = NULL;
+    if (s) {
+        msg_cstr = PyUnicode_AsUTF8AndSize(s, NULL);
+    } else {
+        PyErr_Clear();
+    }
+    const char *stored_ptr = NULL;
+    size_t stored_len = 0;
+    NoxHostExternalRef tok = extref_intern_obj_with_msg(tbl, exc, msg_cstr, &stored_ptr, &stored_len);
+    Py_XDECREF(s);
+    Py_DECREF(exc);
+    if (out_err_token) {
+        *out_err_token = tok;
+    }
+    if (out_err_msg && stored_ptr) {
+        out_err_msg->data = (uint8_t *)stored_ptr;
+        out_err_msg->len = stored_len;
+    }
+    return NOX_HOST_ERR_HOST_EXCEPTION;
+}
+
+static void noxpy_cb_retain(void *user_data, NoxHostExternalRef ref) {
+    extref_retain_token((NoxPyExtRefTable *)user_data, ref);
+}
+
+static void noxpy_cb_release(void *user_data, NoxHostExternalRef ref) {
+    extref_release_token((NoxPyExtRefTable *)user_data, ref);
+}
+
+static NoxHostStatus noxpy_cb_invoke(
+    void *user_data,
+    NoxHostContext *ctx,
+    NoxHostExternalRef target,
+    NoxHostValue args_tuple,
+    NoxHostValue *out_result,
+    uint64_t *out_err_token,
+    NoxHostBuffer *out_err_msg) {
+    if (out_result) {
+        *out_result = 0;
+    }
+    if (out_err_token) {
+        *out_err_token = 0;
+    }
+    if (out_err_msg) {
+        out_err_msg->data = NULL;
+        out_err_msg->len = 0;
+    }
+    NoxPyExtRefTable *tbl = (NoxPyExtRefTable *)user_data;
+    if (!tbl || !tbl->host_ops || !ctx) {
+        return NOX_HOST_ERR_STATE;
+    }
+
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyObject *callable = extref_borrow_newref(tbl, target);
+    if (!callable) {
+        PyErr_SetString(PyExc_ValueError, "noxpy: invalid or released HostObject callback reference");
+        NoxHostStatus err_rc = capture_py_exc_to_host(tbl, out_err_token, out_err_msg);
+        PyGILState_Release(gstate);
+        return err_rc;
+    }
+
+    PyObject *py_args = NULL;
+    if (args_tuple == 0) {
+        py_args = PyTuple_New(0);
+    } else {
+        py_args = hv_to_py_rec(tbl->host_ops, tbl, ctx, args_tuple, 0);
+    }
+    if (!py_args) {
+        NoxHostStatus err_rc = capture_py_exc_to_host(tbl, out_err_token, out_err_msg);
+        Py_DECREF(callable);
+        PyGILState_Release(gstate);
+        return err_rc;
+    }
+    if (!PyTuple_Check(py_args)) {
+        PyObject *wrapped = PyTuple_New(1);
+        if (!wrapped) {
+            Py_DECREF(py_args);
+            Py_DECREF(callable);
+            NoxHostStatus err_rc = capture_py_exc_to_host(tbl, out_err_token, out_err_msg);
+            PyGILState_Release(gstate);
+            return err_rc;
+        }
+        PyTuple_SetItem(wrapped, 0, py_args);
+        py_args = wrapped;
+    }
+
+    PyObject *py_res = PyObject_Call(callable, py_args, NULL);
+    Py_DECREF(py_args);
+    Py_DECREF(callable);
+    if (!py_res) {
+        NoxHostStatus err_rc = capture_py_exc_to_host(tbl, out_err_token, out_err_msg);
+        PyGILState_Release(gstate);
+        return err_rc;
+    }
+
+    if (out_result) {
+        NoxPyConvGuard g;
+        noxpy_conv_guard_init(&g, NOXPY_MAX_CONV_DEPTH, NOXPY_DEFAULT_MAX_ITEMS);
+        if (py_dynamic_to_hv_rec(tbl->host_ops, tbl, ctx, py_res, &g, out_result, "callback return") < 0) {
+            *out_result = 0;
+            Py_DECREF(py_res);
+            NoxHostStatus err_rc = capture_py_exc_to_host(tbl, out_err_token, out_err_msg);
+            PyGILState_Release(gstate);
+            return err_rc;
+        }
+    }
+    Py_DECREF(py_res);
+    PyGILState_Release(gstate);
+    return NOX_HOST_OK;
+}
+
+static NoxPyExtRefTable *extref_table_create(const NoxPyHostOps *ops) {
+    NoxPyExtRefTable *tbl = (NoxPyExtRefTable *)calloc(1, sizeof(NoxPyExtRefTable));
+    if (!tbl) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    if (pthread_mutex_init(&tbl->mu, NULL) != 0) {
+        free(tbl);
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: failed to initialize external ref mutex");
+        return NULL;
+    }
+    atomic_store_explicit(&tbl->table_refs, 1, memory_order_relaxed);
+    tbl->host_ops = ops;
+    tbl->next_gen = 1u;
+    tbl->cb_ops.struct_size = (uint32_t)sizeof(NoxHostCallbackOps);
+    tbl->cb_ops.user_data = tbl;
+    tbl->cb_ops.invoke = noxpy_cb_invoke;
+    tbl->cb_ops.retain = noxpy_cb_retain;
+    tbl->cb_ops.release = noxpy_cb_release;
+    return tbl;
+}
+
 static void destroy_host_context(const NoxPyHostOps *ops, NoxHostContext *ctx) {
     if (!ops || !ctx) {
         return;
@@ -35,7 +429,24 @@ static void destroy_host_context(const NoxPyHostOps *ops, NoxHostContext *ctx) {
     }
 }
 
-static int create_and_init_context(const NoxPyHostOps *ops, NoxHostContext **out_ctx) {
+static int install_callbacks_on_ctx(
+    const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
+    NoxHostContext *ctx) {
+    if (ops && ops->context_set_callbacks && tbl) {
+        NoxHostStatus rc = ops->context_set_callbacks(ctx, &tbl->cb_ops);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int create_and_init_context_with_tbl(
+    const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
+    NoxHostContext **out_ctx) {
     *out_ctx = NULL;
     if (!ops || !ops->context_create) {
         PyErr_SetString(PyExc_SystemError, "noxpy: host ops missing context_create");
@@ -52,6 +463,12 @@ static int create_and_init_context(const NoxPyHostOps *ops, NoxHostContext **out
         noxpy_set_exception_from_host(ops, rc == NOX_HOST_OK ? NOX_HOST_ERR_NOMEM : rc, NULL);
         return -1;
     }
+    if (install_callbacks_on_ctx(ops, tbl, ctx) < 0) {
+        if (ops->context_destroy) {
+            ops->context_destroy(ctx);
+        }
+        return -1;
+    }
     if (ops->module_init) {
         NoxHostError *err = NULL;
         rc = ops->module_init(ctx, &err);
@@ -66,6 +483,10 @@ static int create_and_init_context(const NoxPyHostOps *ops, NoxHostContext **out
     }
     *out_ctx = ctx;
     return 0;
+}
+
+static int create_and_init_context(const NoxPyHostOps *ops, NoxHostContext **out_ctx) {
+    return create_and_init_context_with_tbl(ops, NULL, out_ctx);
 }
 
 int noxpy_module_state_init(NoxPyModuleState *st, const NoxPyHostOps *ops) {
@@ -90,10 +511,18 @@ int noxpy_module_state_init(NoxPyModuleState *st, const NoxPyHostOps *ops) {
     for (size_t i = 0; i < NOXPY_CTX_POOL_CAP; i++) {
         st->pool[i] = NULL;
     }
+    st->async_op_type = NULL;
+    st->ext_refs = extref_table_create(ops);
+    if (!st->ext_refs) {
+        atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
+        return -1;
+    }
 
     /* Eagerly initialize one warm context to validate module init on import. */
     NoxHostContext *warm = NULL;
-    if (create_and_init_context(ops, &warm) < 0) {
+    if (create_and_init_context_with_tbl(ops, st->ext_refs, &warm) < 0) {
+        extref_table_release(st->ext_refs);
+        st->ext_refs = NULL;
         atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
         return -1;
     }
@@ -101,6 +530,42 @@ int noxpy_module_state_init(NoxPyModuleState *st, const NoxPyHostOps *ops) {
     st->pool_count = 1;
 
     atomic_store_explicit(&st->lifecycle, NOXPY_MOD_READY, memory_order_release);
+    return 0;
+}
+
+int noxpy_module_state_init_mod(PyObject *module, NoxPyModuleState *st, const NoxPyHostOps *ops) {
+    if (noxpy_module_state_init(st, ops) < 0) {
+        return -1;
+    }
+    return noxpy_async_init_module(module, st);
+}
+
+int noxpy_module_state_traverse(NoxPyModuleState *st, visitproc visit, void *arg) {
+    if (!st) {
+        return 0;
+    }
+    Py_VISIT(st->async_op_type);
+    NoxPyExtRefTable *tbl = st->ext_refs;
+    if (tbl) {
+        pthread_mutex_lock(&tbl->mu);
+        for (size_t i = 0; i < tbl->cap; i++) {
+            if (tbl->slots[i].in_use && tbl->slots[i].obj) {
+                Py_VISIT(tbl->slots[i].obj);
+            }
+        }
+        pthread_mutex_unlock(&tbl->mu);
+    }
+    return 0;
+}
+
+int noxpy_module_state_clear(NoxPyModuleState *st) {
+    if (!st) {
+        return 0;
+    }
+    Py_CLEAR(st->async_op_type);
+    if (st->ext_refs) {
+        extref_table_clear_slots(st->ext_refs, 0);
+    }
     return 0;
 }
 
@@ -153,7 +618,7 @@ int noxpy_module_ctx_acquire(NoxPyModuleState *st, NoxHostContext **out_ctx) {
         *out_ctx = ctx;
         return 0;
     }
-    return create_and_init_context(st->host_ops, out_ctx);
+    return create_and_init_context_with_tbl(st->host_ops, st->ext_refs, out_ctx);
 }
 
 void noxpy_module_ctx_release(NoxPyModuleState *st, NoxHostContext *ctx) {
@@ -202,6 +667,13 @@ void noxpy_module_state_close(NoxPyModuleState *st) {
 
     for (size_t i = 0; i < local_count; i++) {
         destroy_host_context(st->host_ops, local_ctxs[i]);
+    }
+
+    Py_CLEAR(st->async_op_type);
+    NoxPyExtRefTable *tbl = st->ext_refs;
+    st->ext_refs = NULL;
+    if (tbl) {
+        extref_table_release(tbl);
     }
 
     atomic_store_explicit(&st->lifecycle, NOXPY_MOD_CLOSED, memory_order_release);
@@ -407,6 +879,7 @@ static PyObject *pick_exc_type(NoxHostStatus status, NoxHostSpan class_name) {
         if (span_eq_cstr(class_name, "NotImplementedError")) return PyExc_NotImplementedError;
         if (span_eq_cstr(class_name, "AssertionError")) return PyExc_AssertionError;
         if (span_eq_cstr(class_name, "AttributeError")) return PyExc_AttributeError;
+        if (span_eq_cstr(class_name, "StopIteration")) return PyExc_StopIteration;
     }
     switch (status) {
         case NOX_HOST_ERR_NOMEM:
@@ -414,13 +887,65 @@ static PyObject *pick_exc_type(NoxHostStatus status, NoxHostSpan class_name) {
         case NOX_HOST_ERR_UTF8:
         case NOX_HOST_ERR_INVAL:
         case NOX_HOST_ERR_INVALID_HANDLE:
+        case NOX_HOST_ERR_BUSY:
             return PyExc_ValueError;
+#ifdef NOX_HOST_ERR_OVERFLOW
+        case NOX_HOST_ERR_OVERFLOW:
+            return PyExc_OverflowError;
+#endif
         case NOX_HOST_ERR_VERSION:
         case NOX_HOST_ERR_STATE:
         case NOX_HOST_ERR_EXCEPTION:
+        case NOX_HOST_ERR_HOST_EXCEPTION:
+        case NOX_HOST_ERR_CANCELLED:
         default:
             return PyExc_RuntimeError;
     }
+}
+
+static void set_exception_from_host_tbl(
+    NoxPyExtRefTable *tbl,
+    const NoxPyHostOps *ops,
+    NoxHostStatus status,
+    NoxHostError *err,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs) {
+    if (status == NOX_HOST_ERR_HOST_EXCEPTION && tbl && err && ops && ops->error_host_token) {
+        uint64_t tok = ops->error_host_token(err);
+        if (tok != 0) {
+            PyObject *orig_exc = extref_borrow_newref(tbl, (NoxHostExternalRef)tok);
+            if (orig_exc) {
+                if (ops->error_release) {
+                    ops->error_release(err);
+                }
+                PyErr_SetRaisedException(orig_exc); /* steals orig_exc */
+                return;
+            }
+        }
+    }
+    noxpy_set_exception_from_host_ex(ops, status, err, custom_excs, n_custom_excs);
+}
+
+void noxpy_set_exception_from_host_mod(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostStatus status,
+    NoxHostError *err,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    set_exception_from_host_tbl(st ? st->ext_refs : NULL, ops, status, err, custom_excs, n_custom_excs);
+}
+
+int noxpy_error_is_stop_iteration(const NoxPyHostOps *ops, const NoxHostError *err) {
+    if (!ops || !err || !ops->error_class_name) {
+        return 0;
+    }
+    NoxHostSpan class_name = {0};
+    if (ops->error_class_name(err, &class_name) != NOX_HOST_OK) {
+        return 0;
+    }
+    return span_eq_cstr(class_name, "StopIteration");
 }
 
 void noxpy_set_exception_from_host_ex(
@@ -1073,6 +1598,7 @@ static int validate_v2_ops(const NoxPyHostOps *ops) {
 
 static int py_to_hv_rec(
     const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
     NoxHostContext *ctx,
     PyObject *obj,
     const char *spec,
@@ -1121,7 +1647,7 @@ static int py_to_hv_rec(
                 }
                 return 0;
             }
-            return py_to_hv_rec(ops, ctx, obj, lhs, lhs_len, g, out_val, label);
+            return py_to_hv_rec(ops, tbl, ctx, obj, lhs, lhs_len, g, out_val, label);
         }
     }
     if (bracket_depth != 0) {
@@ -1201,6 +1727,24 @@ static int py_to_hv_rec(
         }
         return 0;
     }
+    if (slice_eq(spec, spec_len, "HostObject")) {
+        if (!tbl || !ops->value_external_ref) {
+            PyErr_SetString(PyExc_SystemError, "noxpy: HostObject callback support unavailable");
+            return -1;
+        }
+        NoxHostExternalRef ref = extref_intern_obj_with_msg(tbl, obj, NULL, NULL, NULL);
+        if (ref == 0) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_external_ref(ctx, ref, out_val);
+        extref_release_token(tbl, ref);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
 
     if (slice_starts_ends(spec, spec_len, "list[", "]")) {
         if (!PyList_Check(obj)) {
@@ -1229,7 +1773,7 @@ static int py_to_hv_rec(
         for (Py_ssize_t i = 0; i < n; i++) {
             PyObject *elem = PyTuple_GetItem(snap, i);
             NoxHostValue child = 0;
-            if (!elem || py_to_hv_rec(ops, ctx, elem, inner, inner_len, g, &child, label) < 0) {
+            if (!elem || py_to_hv_rec(ops, tbl, ctx, elem, inner, inner_len, g, &child, label) < 0) {
                 (void)ops->value_release(ctx, cont);
                 Py_DECREF(snap);
                 noxpy_conv_guard_leave(g);
@@ -1303,7 +1847,7 @@ static int py_to_hv_rec(
                 size_t sub_len = i - seg_start;
                 PyObject *elem = PyTuple_GetItem(obj, elem_idx);
                 NoxHostValue child = 0;
-                if (!elem || py_to_hv_rec(ops, ctx, elem, sub, sub_len, g, &child, label) < 0) {
+                if (!elem || py_to_hv_rec(ops, tbl, ctx, elem, sub, sub_len, g, &child, label) < 0) {
                     (void)ops->value_release(ctx, cont);
                     noxpy_conv_guard_leave(g);
                     return -1;
@@ -1384,8 +1928,8 @@ static int py_to_hv_rec(
             NoxHostValue kh = 0;
             NoxHostValue vh = 0;
             if (!k || !v ||
-                py_to_hv_rec(ops, ctx, k, key_spec, key_len, g, &kh, label) < 0 ||
-                py_to_hv_rec(ops, ctx, v, val_spec, val_len, g, &vh, label) < 0) {
+                py_to_hv_rec(ops, tbl, ctx, k, key_spec, key_len, g, &kh, label) < 0 ||
+                py_to_hv_rec(ops, tbl, ctx, v, val_spec, val_len, g, &vh, label) < 0) {
                 if (kh) (void)ops->value_release(ctx, kh);
                 if (vh) (void)ops->value_release(ctx, vh);
                 Py_DECREF(pair);
@@ -1416,7 +1960,8 @@ static int py_to_hv_rec(
     return -1;
 }
 
-int noxpy_py_to_host_value(
+int noxpy_py_to_host_value_ex(
+    PyObject *module,
     const NoxPyHostOps *ops,
     NoxHostContext *ctx,
     PyObject *obj,
@@ -1424,20 +1969,257 @@ int noxpy_py_to_host_value(
     NoxHostValue *out_val,
     const char *arg_name) {
     if (!ctx || !type_spec || !out_val) {
-        PyErr_SetString(PyExc_SystemError, "noxpy: invalid null argument to noxpy_py_to_host_value");
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid null argument to noxpy_py_to_host_value_ex");
         return -1;
     }
     if (validate_v2_ops(ops) < 0) {
         return -1;
     }
     *out_val = 0;
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
     NoxPyConvGuard g;
     noxpy_conv_guard_init(&g, NOXPY_MAX_CONV_DEPTH, NOXPY_DEFAULT_MAX_ITEMS);
-    return py_to_hv_rec(ops, ctx, obj, type_spec, strlen(type_spec), &g, out_val, arg_name);
+    return py_to_hv_rec(ops, st ? st->ext_refs : NULL, ctx, obj, type_spec, strlen(type_spec), &g, out_val, arg_name);
+}
+
+int noxpy_py_to_host_value(
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    PyObject *obj,
+    const char *type_spec,
+    NoxHostValue *out_val,
+    const char *arg_name) {
+    return noxpy_py_to_host_value_ex(NULL, ops, ctx, obj, type_spec, out_val, arg_name);
+}
+
+static int py_dynamic_to_hv_rec(
+    const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
+    NoxHostContext *ctx,
+    PyObject *obj,
+    NoxPyConvGuard *g,
+    NoxHostValue *out_val,
+    const char *label) {
+    if (!obj || !out_val) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid null dynamic conversion argument");
+        return -1;
+    }
+    if (noxpy_conv_guard_account(g, 1, label) < 0) {
+        return -1;
+    }
+    if (Py_IsNone(obj)) {
+        NoxHostStatus rc = ops->value_none(ctx, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyBool_Check(obj)) {
+        NoxHostStatus rc = ops->value_bool(ctx, Py_IsTrue(obj) ? 1u : 0u, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyLong_Check(obj)) {
+        int64_t v = 0;
+        if (noxpy_py_to_i64_strict(obj, &v, label) < 0) {
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_int(ctx, v, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyFloat_Check(obj)) {
+        double v = 0.0;
+        if (noxpy_py_to_f64_strict(obj, &v, label) < 0) {
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_float(ctx, v, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyUnicode_Check(obj)) {
+        NoxHostSpan sp = {0};
+        if (noxpy_py_to_utf8_span_strict(obj, &sp, label) < 0) {
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_str(ctx, sp.data, sp.len, 0, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyBytes_Check(obj)) {
+        NoxHostSpan sp = {0};
+        if (noxpy_py_to_bytes_span_strict(obj, &sp, label) < 0) {
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_str(ctx, sp.data, sp.len, 1, out_val);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    if (PyList_Check(obj)) {
+        if (noxpy_conv_guard_enter(g, (const void *)obj, label) < 0) {
+            return -1;
+        }
+        PyObject *snap = PySequence_Tuple(obj);
+        if (!snap) {
+            noxpy_conv_guard_leave(g);
+            return -1;
+        }
+        NoxHostValue cont = 0;
+        NoxHostStatus rc = ops->value_container(ctx, NOX_HOST_VALUE_LIST, &cont);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            Py_DECREF(snap);
+            noxpy_conv_guard_leave(g);
+            return -1;
+        }
+        Py_ssize_t n = PyTuple_Size(snap);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *elem = PyTuple_GetItem(snap, i);
+            NoxHostValue child = 0;
+            if (!elem || py_dynamic_to_hv_rec(ops, tbl, ctx, elem, g, &child, label) < 0) {
+                (void)ops->value_release(ctx, cont);
+                Py_DECREF(snap);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+            rc = ops->value_append(ctx, cont, child);
+            (void)ops->value_release(ctx, child);
+            if (rc != NOX_HOST_OK) {
+                noxpy_set_exception_from_host(ops, rc, NULL);
+                (void)ops->value_release(ctx, cont);
+                Py_DECREF(snap);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+        }
+        Py_DECREF(snap);
+        noxpy_conv_guard_leave(g);
+        *out_val = cont;
+        return 0;
+    }
+    if (PyTuple_Check(obj)) {
+        if (noxpy_conv_guard_enter(g, (const void *)obj, label) < 0) {
+            return -1;
+        }
+        NoxHostValue cont = 0;
+        NoxHostStatus rc = ops->value_container(ctx, NOX_HOST_VALUE_TUPLE, &cont);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            noxpy_conv_guard_leave(g);
+            return -1;
+        }
+        Py_ssize_t n = PyTuple_Size(obj);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *elem = PyTuple_GetItem(obj, i);
+            NoxHostValue child = 0;
+            if (!elem || py_dynamic_to_hv_rec(ops, tbl, ctx, elem, g, &child, label) < 0) {
+                (void)ops->value_release(ctx, cont);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+            rc = ops->value_append(ctx, cont, child);
+            (void)ops->value_release(ctx, child);
+            if (rc != NOX_HOST_OK) {
+                noxpy_set_exception_from_host(ops, rc, NULL);
+                (void)ops->value_release(ctx, cont);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+        }
+        noxpy_conv_guard_leave(g);
+        *out_val = cont;
+        return 0;
+    }
+    if (PyDict_Check(obj)) {
+        if (noxpy_conv_guard_enter(g, (const void *)obj, label) < 0) {
+            return -1;
+        }
+        PyObject *items = PyDict_Items(obj);
+        if (!items) {
+            noxpy_conv_guard_leave(g);
+            return -1;
+        }
+        NoxHostValue dct = 0;
+        NoxHostStatus rc = ops->value_container(ctx, NOX_HOST_VALUE_DICT, &dct);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            Py_DECREF(items);
+            noxpy_conv_guard_leave(g);
+            return -1;
+        }
+        Py_ssize_t n = PyList_Size(items);
+        for (Py_ssize_t i = 0; i < n; i++) {
+            PyObject *pair = PySequence_GetItem(items, i);
+            PyObject *k = pair ? PyTuple_GetItem(pair, 0) : NULL;
+            PyObject *v = pair ? PyTuple_GetItem(pair, 1) : NULL;
+            NoxHostValue kh = 0;
+            NoxHostValue vh = 0;
+            if (!k || !v ||
+                py_dynamic_to_hv_rec(ops, tbl, ctx, k, g, &kh, label) < 0 ||
+                py_dynamic_to_hv_rec(ops, tbl, ctx, v, g, &vh, label) < 0) {
+                if (kh) (void)ops->value_release(ctx, kh);
+                if (vh) (void)ops->value_release(ctx, vh);
+                Py_XDECREF(pair);
+                (void)ops->value_release(ctx, dct);
+                Py_DECREF(items);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+            rc = ops->value_dict_set(ctx, dct, kh, vh);
+            (void)ops->value_release(ctx, kh);
+            (void)ops->value_release(ctx, vh);
+            Py_DECREF(pair);
+            if (rc != NOX_HOST_OK) {
+                noxpy_set_exception_from_host(ops, rc, NULL);
+                (void)ops->value_release(ctx, dct);
+                Py_DECREF(items);
+                noxpy_conv_guard_leave(g);
+                return -1;
+            }
+        }
+        Py_DECREF(items);
+        noxpy_conv_guard_leave(g);
+        *out_val = dct;
+        return 0;
+    }
+
+    if (tbl && ops->value_external_ref) {
+        NoxHostExternalRef ref = extref_intern_obj_with_msg(tbl, obj, NULL, NULL, NULL);
+        if (ref == 0) {
+            PyErr_NoMemory();
+            return -1;
+        }
+        NoxHostStatus rc = ops->value_external_ref(ctx, ref, out_val);
+        extref_release_token(tbl, ref);
+        if (rc != NOX_HOST_OK) {
+            noxpy_set_exception_from_host(ops, rc, NULL);
+            return -1;
+        }
+        return 0;
+    }
+    PyErr_Format(PyExc_TypeError, "%s: unsupported Python callback value", label);
+    return -1;
 }
 
 static PyObject *hv_to_py_rec(
     const NoxPyHostOps *ops,
+    NoxPyExtRefTable *tbl,
     NoxHostContext *ctx,
     NoxHostValue val,
     size_t depth) {
@@ -1525,7 +2307,7 @@ static PyObject *hv_to_py_rec(
                     Py_DECREF(lst);
                     return NULL;
                 }
-                PyObject *py_elem = hv_to_py_rec(ops, ctx, child, depth + 1);
+                PyObject *py_elem = hv_to_py_rec(ops, tbl, ctx, child, depth + 1);
                 (void)ops->value_release(ctx, child);
                 if (!py_elem) {
                     Py_DECREF(lst);
@@ -1558,7 +2340,7 @@ static PyObject *hv_to_py_rec(
                     Py_DECREF(tup);
                     return NULL;
                 }
-                PyObject *py_elem = hv_to_py_rec(ops, ctx, child, depth + 1);
+                PyObject *py_elem = hv_to_py_rec(ops, tbl, ctx, child, depth + 1);
                 (void)ops->value_release(ctx, child);
                 if (!py_elem) {
                     Py_DECREF(tup);
@@ -1588,9 +2370,9 @@ static PyObject *hv_to_py_rec(
                     Py_DECREF(dct);
                     return NULL;
                 }
-                PyObject *py_k = hv_to_py_rec(ops, ctx, kh, depth + 1);
+                PyObject *py_k = hv_to_py_rec(ops, tbl, ctx, kh, depth + 1);
                 (void)ops->value_release(ctx, kh);
-                PyObject *py_v = py_k ? hv_to_py_rec(ops, ctx, vh, depth + 1) : NULL;
+                PyObject *py_v = py_k ? hv_to_py_rec(ops, tbl, ctx, vh, depth + 1) : NULL;
                 (void)ops->value_release(ctx, vh);
                 if (!py_k || !py_v) {
                     Py_XDECREF(py_k);
@@ -1608,24 +2390,51 @@ static PyObject *hv_to_py_rec(
             }
             return dct;
         }
+        case NOX_HOST_VALUE_EXTERNAL_REF: {
+            if (!tbl || !ops->value_get_external_ref) {
+                PyErr_SetString(PyExc_SystemError, "noxpy: external_ref support unavailable");
+                return NULL;
+            }
+            NoxHostExternalRef ref = 0;
+            rc = ops->value_get_external_ref(ctx, val, &ref);
+            if (rc != NOX_HOST_OK || ref == 0) {
+                noxpy_set_exception_from_host(ops, rc == NOX_HOST_OK ? NOX_HOST_ERR_INVALID_HANDLE : rc, NULL);
+                return NULL;
+            }
+            PyObject *obj = extref_borrow_newref(tbl, ref);
+            if (!obj) {
+                PyErr_SetString(PyExc_ValueError, "noxpy: invalid or released HostObject token");
+                return NULL;
+            }
+            return obj;
+        }
         default:
             PyErr_Format(PyExc_RuntimeError, "noxpy: unknown NoxHostValue kind (%d)", (int)kind);
             return NULL;
     }
 }
 
-PyObject *noxpy_host_value_to_py(
+PyObject *noxpy_host_value_to_py_ex(
+    PyObject *module,
     const NoxPyHostOps *ops,
     NoxHostContext *ctx,
     NoxHostValue val) {
     if (!ctx) {
-        PyErr_SetString(PyExc_SystemError, "noxpy: NULL context in noxpy_host_value_to_py");
+        PyErr_SetString(PyExc_SystemError, "noxpy: NULL context in noxpy_host_value_to_py_ex");
         return NULL;
     }
     if (validate_v2_ops(ops) < 0) {
         return NULL;
     }
-    return hv_to_py_rec(ops, ctx, val, 0);
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    return hv_to_py_rec(ops, st ? st->ext_refs : NULL, ctx, val, 0);
+}
+
+PyObject *noxpy_host_value_to_py(
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    NoxHostValue val) {
+    return noxpy_host_value_to_py_ex(NULL, ops, ctx, val);
 }
 
 static _Atomic uint64_t g_noxpy_instance_gen = 1;
@@ -1644,6 +2453,51 @@ int noxpy_host_context_create_and_init(const NoxPyHostOps *ops, NoxHostContext *
     return create_and_init_context(ops, out_ctx);
 }
 
+int noxpy_host_context_create_for_module(
+    PyObject *module, const NoxPyHostOps *ops, NoxHostContext **out_ctx) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    return create_and_init_context_with_tbl(ops, st ? st->ext_refs : NULL, out_ctx);
+}
+
+int noxpy_context_install_callbacks(PyObject *module, const NoxPyHostOps *ops, NoxHostContext *ctx) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    return install_callbacks_on_ctx(ops, st ? st->ext_refs : NULL, ctx);
+}
+
+NoxHostExternalRef noxpy_extref_intern(PyObject *module, PyObject *obj) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    if (!st || !st->ext_refs || !obj) {
+        return 0;
+    }
+    NoxHostExternalRef ref = extref_intern_obj_with_msg(st->ext_refs, obj, NULL, NULL, NULL);
+    if (ref == 0 && !PyErr_Occurred()) {
+        PyErr_NoMemory();
+    }
+    return ref;
+}
+
+PyObject *noxpy_extref_take_returned(PyObject *module, NoxHostExternalRef ref) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    if (!st || !st->ext_refs || ref == 0) {
+        PyErr_SetString(PyExc_ValueError, "noxpy: invalid HostObject return reference");
+        return NULL;
+    }
+    PyObject *obj = extref_borrow_newref(st->ext_refs, ref);
+    extref_release_token(st->ext_refs, ref);
+    if (!obj) {
+        PyErr_SetString(PyExc_ValueError, "noxpy: released or forged HostObject return reference");
+        return NULL;
+    }
+    return obj;
+}
+
+void noxpy_extref_release_token(PyObject *module, NoxHostExternalRef ref) {
+    NoxPyModuleState *st = module ? (NoxPyModuleState *)PyModule_GetState(module) : NULL;
+    if (st && st->ext_refs && ref != 0) {
+        extref_release_token(st->ext_refs, ref);
+    }
+}
+
 void noxpy_host_context_fini_and_destroy(const NoxPyHostOps *ops, NoxHostContext *ctx) {
     destroy_host_context(ops, ctx);
 }
@@ -1654,6 +2508,83 @@ static uint64_t next_instance_gen(void) {
         g = atomic_fetch_add_explicit(&g_noxpy_instance_gen, 1, memory_order_relaxed);
     }
     return g;
+}
+
+struct NoxPySharedCtx {
+    const NoxPyHostOps *ops;
+    NoxHostContext *ctx;
+    _Atomic uint32_t refs;
+};
+
+static NoxPySharedCtx *shared_ctx_create(const NoxPyHostOps *ops, NoxHostContext *ctx) {
+    NoxPySharedCtx *sc = (NoxPySharedCtx *)malloc(sizeof(NoxPySharedCtx));
+    if (!sc) {
+        return NULL;
+    }
+    sc->ops = ops;
+    sc->ctx = ctx;
+    atomic_store_explicit(&sc->refs, 1u, memory_order_relaxed);
+    return sc;
+}
+
+static NoxPySharedCtx *shared_ctx_retain(NoxPySharedCtx *sc) {
+    if (sc) {
+        atomic_fetch_add_explicit(&sc->refs, 1u, memory_order_relaxed);
+    }
+    return sc;
+}
+
+static void shared_ctx_release(NoxPySharedCtx *sc, int release_gil) {
+    if (!sc) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&sc->refs, 1u, memory_order_acq_rel) == 1u) {
+        const NoxPyHostOps *ops = sc->ops;
+        NoxHostContext *ctx = sc->ctx;
+        free(sc);
+        if (ctx && ops) {
+            if (release_gil) {
+                Py_BEGIN_ALLOW_THREADS
+                destroy_host_context(ops, ctx);
+                Py_END_ALLOW_THREADS
+            } else {
+                destroy_host_context(ops, ctx);
+            }
+        }
+    }
+}
+
+static int obj_init_with_sc(
+    NoxPyObjectData *data,
+    PyObject *owner_module,
+    NoxPySharedCtx *sc,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy) {
+    if (!data || !owner_module || !sc || !sc->ops || !sc->ctx || handle == 0) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_init");
+        return -1;
+    }
+    memset(data, 0, sizeof(*data));
+    if (pthread_mutex_init(&data->lock, NULL) != 0) {
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: failed to initialize instance mutex");
+        return -1;
+    }
+    data->lock_ready = 1u;
+    data->owner_module = Py_NewRef(owner_module);
+    data->host_ops = sc->ops;
+    data->owner_ctx = sc->ctx;
+    data->shared_ctx = sc;
+    data->handle = handle;
+    data->type_tag = type_tag;
+    data->instance_gen = next_instance_gen();
+    data->owner_tid = noxpy_current_tid();
+    data->thread_policy = thread_policy;
+    data->closed = 0u;
+    data->initialized = 1u;
+    atomic_store_explicit(&data->pending_async, 0, memory_order_relaxed);
+    atomic_store_explicit(&data->has_deferred_close, 0u, memory_order_relaxed);
+    return 0;
 }
 
 int noxpy_obj_init(
@@ -1668,23 +2599,73 @@ int noxpy_obj_init(
         PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_init");
         return -1;
     }
-    memset(data, 0, sizeof(*data));
-    if (pthread_mutex_init(&data->lock, NULL) != 0) {
-        PyErr_SetString(PyExc_RuntimeError, "noxpy: failed to initialize instance mutex");
+    NoxPySharedCtx *sc = shared_ctx_create(ops, owner_ctx);
+    if (!sc) {
+        PyErr_NoMemory();
         return -1;
     }
-    data->lock_ready = 1u;
-    data->owner_module = Py_NewRef(owner_module);
-    data->host_ops = ops;
-    data->owner_ctx = owner_ctx;
-    data->handle = handle;
-    data->type_tag = type_tag;
-    data->instance_gen = next_instance_gen();
-    data->owner_tid = noxpy_current_tid();
-    data->thread_policy = thread_policy;
-    data->closed = 0u;
-    data->initialized = 1u;
+    if (obj_init_with_sc(data, owner_module, sc, handle, type_tag, thread_policy) < 0) {
+        free(sc);
+        return -1;
+    }
     return 0;
+}
+
+PyObject *noxpy_obj_new_from_shared_handle(
+    PyTypeObject *cls,
+    PyObject *owner_module,
+    NoxPySharedCtx *shared_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy) {
+    if (!cls || !owner_module || !shared_ctx || !shared_ctx->ops || !shared_ctx->ctx || handle == 0) {
+        if (handle != 0 && shared_ctx && shared_ctx->ctx && shared_ctx->ops && shared_ctx->ops->handle_release) {
+            Py_BEGIN_ALLOW_THREADS
+            (void)shared_ctx->ops->handle_release(shared_ctx->ctx, handle);
+            Py_END_ALLOW_THREADS
+        }
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_new_from_shared_handle");
+        return NULL;
+    }
+    allocfunc tp_alloc = (allocfunc)PyType_GetSlot(cls, Py_tp_alloc);
+    if (!tp_alloc) {
+        Py_BEGIN_ALLOW_THREADS
+        if (shared_ctx->ops->handle_release) {
+            (void)shared_ctx->ops->handle_release(shared_ctx->ctx, handle);
+        }
+        Py_END_ALLOW_THREADS
+        PyErr_SetString(PyExc_SystemError, "noxpy: native type missing Py_tp_alloc slot");
+        return NULL;
+    }
+    PyObject *obj = tp_alloc(cls, 0);
+    if (!obj) {
+        Py_BEGIN_ALLOW_THREADS
+        if (shared_ctx->ops->handle_release) {
+            (void)shared_ctx->ops->handle_release(shared_ctx->ctx, handle);
+        }
+        Py_END_ALLOW_THREADS
+        return NULL;
+    }
+    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(obj, cls);
+    NoxPySharedCtx *retained = shared_ctx_retain(shared_ctx);
+    if (!data || obj_init_with_sc(data, owner_module, retained, handle, type_tag, thread_policy) < 0) {
+        if (data && data->initialized) {
+            noxpy_obj_close(data);
+        } else {
+            Py_BEGIN_ALLOW_THREADS
+            if (retained->ops->handle_release) {
+                (void)retained->ops->handle_release(retained->ctx, handle);
+            }
+            Py_END_ALLOW_THREADS
+            shared_ctx_release(retained, 1);
+        }
+        Py_DECREF(obj);
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(PyExc_SystemError, "noxpy: failed to initialize shared handle wrapper");
+        }
+        return NULL;
+    }
+    return obj;
 }
 
 PyObject *noxpy_obj_new_from_handle(
@@ -1709,45 +2690,19 @@ PyObject *noxpy_obj_new_from_handle(
         PyErr_SetString(PyExc_SystemError, "noxpy: invalid arguments to noxpy_obj_new_from_handle");
         return NULL;
     }
-    allocfunc tp_alloc = (allocfunc)PyType_GetSlot(cls, Py_tp_alloc);
-    if (!tp_alloc) {
+    NoxPySharedCtx *sc = shared_ctx_create(ops, owner_ctx);
+    if (!sc) {
         Py_BEGIN_ALLOW_THREADS
         if (ops->handle_release) {
             (void)ops->handle_release(owner_ctx, handle);
         }
         destroy_host_context(ops, owner_ctx);
         Py_END_ALLOW_THREADS
-        PyErr_SetString(PyExc_SystemError, "noxpy: native type missing Py_tp_alloc slot");
+        PyErr_NoMemory();
         return NULL;
     }
-    PyObject *obj = tp_alloc(cls, 0);
-    if (!obj) {
-        Py_BEGIN_ALLOW_THREADS
-        if (ops->handle_release) {
-            (void)ops->handle_release(owner_ctx, handle);
-        }
-        destroy_host_context(ops, owner_ctx);
-        Py_END_ALLOW_THREADS
-        return NULL;
-    }
-    NoxPyObjectData *data = (NoxPyObjectData *)PyObject_GetTypeData(obj, cls);
-    if (!data || noxpy_obj_init(data, owner_module, ops, owner_ctx, handle, type_tag, thread_policy) < 0) {
-        if (data && data->initialized) {
-            noxpy_obj_close(data);
-        } else {
-            Py_BEGIN_ALLOW_THREADS
-            if (ops->handle_release) {
-                (void)ops->handle_release(owner_ctx, handle);
-            }
-            destroy_host_context(ops, owner_ctx);
-            Py_END_ALLOW_THREADS
-        }
-        Py_DECREF(obj);
-        if (!PyErr_Occurred()) {
-            PyErr_SetString(PyExc_SystemError, "noxpy: failed to initialize returned handle wrapper");
-        }
-        return NULL;
-    }
+    PyObject *obj = noxpy_obj_new_from_shared_handle(cls, owner_module, sc, handle, type_tag, thread_policy);
+    shared_ctx_release(sc, 1); /* drop temporary creation ref; wrapper holds its own */
     return obj;
 }
 
@@ -1853,35 +2808,86 @@ static void obj_close_impl(NoxPyObjectData *data, int release_gil) {
     local_mod = data->owner_module;
     local_ops = data->host_ops;
     local_ctx = data->owner_ctx;
+    NoxPySharedCtx *local_sc = data->shared_ctx;
     local_handle = data->handle;
     data->closed = 1u;
     data->owner_module = NULL;
     data->host_ops = NULL;
     data->owner_ctx = NULL;
+    data->shared_ctx = NULL;
     data->handle = 0;
+
+    int defer_native = 0;
+    if (atomic_load_explicit(&data->pending_async, memory_order_acquire) > 0 && local_sc != NULL) {
+        data->deferred_sc = local_sc;
+        data->deferred_handle = local_handle;
+        atomic_store_explicit(&data->has_deferred_close, 1u, memory_order_release);
+        defer_native = 1;
+    }
+
     if (data->lock_ready) {
         pthread_mutex_unlock(&data->lock);
     }
 
     /* Release native handle/context and drop PyObject ref STRICTLY outside locks (AGENTS.md §9/§10.4). */
-    if (release_gil) {
-        Py_BEGIN_ALLOW_THREADS
+    if (!defer_native) {
         if (local_handle != 0 && local_ctx && local_ops && local_ops->handle_release) {
-            (void)local_ops->handle_release(local_ctx, local_handle);
+            if (release_gil) {
+                Py_BEGIN_ALLOW_THREADS
+                (void)local_ops->handle_release(local_ctx, local_handle);
+                Py_END_ALLOW_THREADS
+            } else {
+                (void)local_ops->handle_release(local_ctx, local_handle);
+            }
         }
-        if (local_ctx && local_ops) {
-            destroy_host_context(local_ops, local_ctx);
-        }
-        Py_END_ALLOW_THREADS
-    } else {
-        if (local_handle != 0 && local_ctx && local_ops && local_ops->handle_release) {
-            (void)local_ops->handle_release(local_ctx, local_handle);
-        }
-        if (local_ctx && local_ops) {
-            destroy_host_context(local_ops, local_ctx);
-        }
+        shared_ctx_release(local_sc, release_gil);
     }
     Py_XDECREF(local_mod);
+}
+
+static void obj_async_begin(NoxPyObjectData *data) {
+    if (data) {
+        atomic_fetch_add_explicit(&data->pending_async, 1, memory_order_acq_rel);
+    }
+}
+
+static void obj_async_end(NoxPyObjectData *data, int release_gil) {
+    if (!data) {
+        return;
+    }
+    if (atomic_fetch_sub_explicit(&data->pending_async, 1, memory_order_acq_rel) == 1) {
+        if (!atomic_load_explicit(&data->has_deferred_close, memory_order_acquire)) {
+            return;
+        }
+        NoxPySharedCtx *d_sc = NULL;
+        NoxHostHandle d_handle = 0;
+        if (data->lock_ready) {
+            if (release_gil) {
+                Py_BEGIN_ALLOW_THREADS
+                pthread_mutex_lock(&data->lock);
+                Py_END_ALLOW_THREADS
+            } else {
+                pthread_mutex_lock(&data->lock);
+            }
+            d_sc = data->deferred_sc;
+            d_handle = data->deferred_handle;
+            data->deferred_sc = NULL;
+            data->deferred_handle = 0;
+            pthread_mutex_unlock(&data->lock);
+        }
+        if (d_sc) {
+            if (d_handle != 0 && d_sc->ctx && d_sc->ops && d_sc->ops->handle_release) {
+                if (release_gil) {
+                    Py_BEGIN_ALLOW_THREADS
+                    (void)d_sc->ops->handle_release(d_sc->ctx, d_handle);
+                    Py_END_ALLOW_THREADS
+                } else {
+                    (void)d_sc->ops->handle_release(d_sc->ctx, d_handle);
+                }
+            }
+            shared_ctx_release(d_sc, release_gil);
+        }
+    }
 }
 
 void noxpy_obj_close(NoxPyObjectData *data) {
@@ -1956,4 +2962,687 @@ PyObject *noxpy_obj_close_method(PyObject *self, PyObject *ignored) {
         obj_close_impl(data, 1);
     }
     Py_RETURN_NONE;
+}
+
+/* ============================================================================
+ * Phase 4 (0.4): Managed asyncio.Future bridge (`NoxHostTask`)
+ * ============================================================================ */
+
+struct NoxPyAsyncOp {
+    PyObject *self_obj;
+    PyObject *owner_module;
+    PyObject *loop;
+    PyObject *fut;
+    PyObject *owner_self;
+    PyObject *ret_cls;
+    const NoxPyHostOps *host_ops;
+    NoxPyExtRefTable *ext_refs;
+    NoxHostContext *ctx;
+    NoxPyObjectData *owner_obj_data;
+    NoxHostTask task;
+    int owns_ctx;
+    int task_known;
+    int abandoned_on_worker;
+    NoxHostStatus final_status;
+    char *ret_type;
+    char *ret_marshal;
+    uint64_t ret_tag;
+    uint8_t ret_policy;
+    NoxPyCustomExc *custom_excs;
+    size_t n_custom_excs;
+    NoxHostExternalRef *kept_extrefs;
+    size_t n_kept_extrefs;
+    _Atomic int cleaned;
+    pthread_mutex_t mu;
+    int lock_ready;
+};
+
+static char *dup_cstr(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    char *out = (char *)malloc(len + 1);
+    if (out) {
+        memcpy(out, s, len + 1);
+    }
+    return out;
+}
+
+static void async_op_cleanup_native(NoxPyAsyncOp *op, int release_gil, int skip_ctx_destroy) {
+    if (!op) {
+        return;
+    }
+    if (atomic_exchange_explicit(&op->cleaned, 1, memory_order_acq_rel) != 0) {
+        return;
+    }
+    if (op->kept_extrefs) {
+        for (size_t i = 0; i < op->n_kept_extrefs; i++) {
+            if (op->kept_extrefs[i] != 0) {
+                extref_release_token(op->ext_refs, op->kept_extrefs[i]);
+            }
+        }
+        free(op->kept_extrefs);
+        op->kept_extrefs = NULL;
+        op->n_kept_extrefs = 0;
+    }
+    if (op->owns_ctx) {
+        if (op->ctx && op->host_ops && !skip_ctx_destroy) {
+            if (release_gil) {
+                Py_BEGIN_ALLOW_THREADS
+                destroy_host_context(op->host_ops, op->ctx);
+                Py_END_ALLOW_THREADS
+            } else {
+                destroy_host_context(op->host_ops, op->ctx);
+            }
+        }
+        op->ctx = NULL;
+    } else if (op->owner_obj_data) {
+        obj_async_end(op->owner_obj_data, release_gil);
+        op->owner_obj_data = NULL;
+    }
+    if (op->ext_refs) {
+        extref_table_release(op->ext_refs);
+        op->ext_refs = NULL;
+    }
+    free(op->ret_type);
+    op->ret_type = NULL;
+    free(op->ret_marshal);
+    op->ret_marshal = NULL;
+    free(op->custom_excs);
+    op->custom_excs = NULL;
+    op->n_custom_excs = 0;
+}
+
+static int call_fut_is_cancelled(PyObject *fut) {
+    if (!fut) {
+        return 0;
+    }
+    PyObject *fn = PyObject_GetAttrString(fut, "cancelled");
+    if (!fn) {
+        PyErr_Clear();
+        return 0;
+    }
+    PyObject *res = PyObject_CallNoArgs(fn);
+    Py_DECREF(fn);
+    if (!res) {
+        PyErr_Clear();
+        return 0;
+    }
+    int is_true = PyObject_IsTrue(res);
+    Py_DECREF(res);
+    if (is_true < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    return is_true;
+}
+
+static int call_fut_is_done(PyObject *fut) {
+    if (!fut) {
+        return 1;
+    }
+    PyObject *fn = PyObject_GetAttrString(fut, "done");
+    if (!fn) {
+        PyErr_Clear();
+        return 0;
+    }
+    PyObject *res = PyObject_CallNoArgs(fn);
+    Py_DECREF(fn);
+    if (!res) {
+        PyErr_Clear();
+        return 0;
+    }
+    int is_true = PyObject_IsTrue(res);
+    Py_DECREF(res);
+    if (is_true < 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    return is_true;
+}
+
+static void call_fut_set_result(PyObject *fut, PyObject *val) {
+    if (!fut || !val) {
+        return;
+    }
+    PyObject *fn = PyObject_GetAttrString(fut, "set_result");
+    if (!fn) {
+        PyErr_Clear();
+        return;
+    }
+    PyObject *r = PyObject_CallFunctionObjArgs(fn, val, NULL);
+    Py_DECREF(fn);
+    if (!r) {
+        PyErr_Clear();
+    } else {
+        Py_DECREF(r);
+    }
+}
+
+static void call_fut_set_exception(PyObject *fut, PyObject *exc) {
+    if (!fut || !exc) {
+        return;
+    }
+    PyObject *fn = PyObject_GetAttrString(fut, "set_exception");
+    if (!fn) {
+        PyErr_Clear();
+        return;
+    }
+    PyObject *r = PyObject_CallFunctionObjArgs(fn, exc, NULL);
+    Py_DECREF(fn);
+    if (!r) {
+        PyErr_Clear();
+    } else {
+        Py_DECREF(r);
+    }
+}
+
+static void call_fut_cancel(PyObject *fut) {
+    if (!fut) {
+        return;
+    }
+    PyObject *fn = PyObject_GetAttrString(fut, "cancel");
+    if (!fn) {
+        PyErr_Clear();
+        return;
+    }
+    PyObject *r = PyObject_CallNoArgs(fn);
+    Py_DECREF(fn);
+    if (!r) {
+        PyErr_Clear();
+    } else {
+        Py_DECREF(r);
+    }
+}
+
+static PyObject *async_op_on_fut_done(PyObject *self, PyObject *fut_arg) {
+    (void)fut_arg;
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData(self, Py_TYPE(self));
+    if (op && !atomic_load_explicit(&op->cleaned, memory_order_acquire) && call_fut_is_cancelled(op->fut)) {
+        NoxHostContext *ctx = NULL;
+        NoxHostTask task = 0;
+        const NoxPyHostOps *ops = op->host_ops;
+        if (op->lock_ready) {
+            pthread_mutex_lock(&op->mu);
+            ctx = op->ctx;
+            if (op->task_known) {
+                task = op->task;
+            }
+            pthread_mutex_unlock(&op->mu);
+        }
+        if (ctx && task != 0 && ops && ops->task_cancel) {
+            (void)ops->task_cancel(ctx, task);
+        }
+    }
+    Py_RETURN_NONE;
+}
+
+static PyObject *async_op_deliver(PyObject *self, PyObject *ignored) {
+    (void)ignored;
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData(self, Py_TYPE(self));
+    if (!op || !op->host_ops || !op->ctx || op->task == 0) {
+        Py_RETURN_NONE;
+    }
+    const NoxPyHostOps *ops = op->host_ops;
+    NoxHostContext *ctx = op->ctx;
+    NoxHostTask task = op->task;
+
+    NoxHostValue res_val = 0;
+    NoxHostError *err = NULL;
+    NoxHostStatus take_rc = NOX_HOST_ERR_STATE;
+    if (ops->task_take_result) {
+        take_rc = ops->task_take_result(ctx, task, &res_val, &err);
+    }
+    if (ops->task_release) {
+        (void)ops->task_release(ctx, task);
+    }
+    op->task = 0;
+
+    if (call_fut_is_done(op->fut)) {
+        if (res_val && ops->value_release) {
+            (void)ops->value_release(ctx, res_val);
+        }
+        if (err && ops->error_release) {
+            ops->error_release(err);
+        }
+        async_op_cleanup_native(op, 1, 0);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->owner_self);
+        Py_RETURN_NONE;
+    }
+
+    if (take_rc == NOX_HOST_OK) {
+        if (op->ret_marshal && strcmp(op->ret_marshal, "handle") == 0) {
+            if (!ops->value_get_handle || !op->ret_cls) {
+                if (res_val && ops->value_release) {
+                    (void)ops->value_release(ctx, res_val);
+                }
+                PyErr_SetString(PyExc_SystemError, "noxpy: missing async handle return metadata");
+                PyObject *exc = PyErr_GetRaisedException();
+                async_op_cleanup_native(op, 1, 0);
+                call_fut_set_exception(op->fut, exc);
+                Py_XDECREF(exc);
+                Py_CLEAR(op->fut);
+                Py_CLEAR(op->loop);
+                Py_CLEAR(op->owner_self);
+                Py_RETURN_NONE;
+            }
+            NoxHostHandle h = 0;
+            NoxHostStatus grc = res_val ? ops->value_get_handle(ctx, res_val, &h) : NOX_HOST_ERR_INVALID_HANDLE;
+            if (res_val && ops->value_release) {
+                (void)ops->value_release(ctx, res_val);
+            }
+            if (grc != NOX_HOST_OK || h == 0) {
+                set_exception_from_host_tbl(
+                    op->ext_refs, ops, grc == NOX_HOST_OK ? NOX_HOST_ERR_INVALID_HANDLE : grc, NULL, op->custom_excs, op->n_custom_excs);
+                PyObject *exc = PyErr_GetRaisedException();
+                async_op_cleanup_native(op, 1, 0);
+                call_fut_set_exception(op->fut, exc);
+                Py_XDECREF(exc);
+                Py_CLEAR(op->fut);
+                Py_CLEAR(op->loop);
+                Py_CLEAR(op->owner_self);
+                Py_RETURN_NONE;
+            }
+            /* Detach ctx ownership before async_op_cleanup_native so it transfers cleanly to wrapper. */
+            op->ctx = NULL;
+            op->owns_ctx = 0;
+            PyObject *py_obj = noxpy_obj_new_from_handle(
+                (PyTypeObject *)op->ret_cls,
+                op->owner_module,
+                ops,
+                ctx,
+                h,
+                op->ret_tag,
+                op->ret_policy);
+            if (!py_obj) {
+                PyObject *exc = PyErr_GetRaisedException();
+                async_op_cleanup_native(op, 1, 0);
+                call_fut_set_exception(op->fut, exc);
+                Py_XDECREF(exc);
+                Py_CLEAR(op->fut);
+                Py_CLEAR(op->loop);
+                Py_CLEAR(op->owner_self);
+                Py_RETURN_NONE;
+            }
+            async_op_cleanup_native(op, 1, 0);
+            call_fut_set_result(op->fut, py_obj);
+            Py_DECREF(py_obj);
+            Py_CLEAR(op->fut);
+            Py_CLEAR(op->loop);
+            Py_CLEAR(op->owner_self);
+            Py_RETURN_NONE;
+        }
+
+        PyObject *py_res = NULL;
+        if (res_val == 0 || (op->ret_type && strcmp(op->ret_type, "None") == 0)) {
+            if (res_val && ops->value_release) {
+                (void)ops->value_release(ctx, res_val);
+            }
+            py_res = Py_NewRef(Py_None);
+        } else {
+            py_res = hv_to_py_rec(ops, op->ext_refs, ctx, res_val, 0);
+            if (ops->value_release) {
+                (void)ops->value_release(ctx, res_val);
+            }
+        }
+        if (!py_res) {
+            PyObject *exc = PyErr_GetRaisedException();
+            async_op_cleanup_native(op, 1, 0);
+            call_fut_set_exception(op->fut, exc);
+            Py_XDECREF(exc);
+            Py_CLEAR(op->fut);
+            Py_CLEAR(op->loop);
+            Py_CLEAR(op->owner_self);
+            Py_RETURN_NONE;
+        }
+        async_op_cleanup_native(op, 1, 0);
+        call_fut_set_result(op->fut, py_res);
+        Py_DECREF(py_res);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->owner_self);
+        Py_RETURN_NONE;
+    }
+
+    if (take_rc == NOX_HOST_ERR_CANCELLED) {
+        if (err && ops->error_release) {
+            ops->error_release(err);
+        }
+        async_op_cleanup_native(op, 1, 0);
+        call_fut_cancel(op->fut);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->owner_self);
+        Py_RETURN_NONE;
+    }
+
+    set_exception_from_host_tbl(op->ext_refs, ops, take_rc, err, op->custom_excs, op->n_custom_excs);
+    PyObject *exc = PyErr_GetRaisedException();
+    async_op_cleanup_native(op, 1, 0);
+    if (exc) {
+        call_fut_set_exception(op->fut, exc);
+        Py_DECREF(exc);
+    }
+    Py_CLEAR(op->fut);
+    Py_CLEAR(op->loop);
+    Py_CLEAR(op->owner_self);
+    Py_RETURN_NONE;
+}
+
+static int async_op_traverse(PyObject *self, visitproc visit, void *arg) {
+    PyTypeObject *cls = Py_TYPE(self);
+    Py_VISIT(cls);
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData_DuringGC(self, cls);
+    if (op) {
+        Py_VISIT(op->owner_module);
+        Py_VISIT(op->loop);
+        Py_VISIT(op->fut);
+        Py_VISIT(op->owner_self);
+        Py_VISIT(op->ret_cls);
+    }
+    return 0;
+}
+
+static int async_op_clear(PyObject *self) {
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData_DuringGC(self, cls);
+    if (op) {
+        async_op_cleanup_native(op, 0, op->abandoned_on_worker);
+        Py_CLEAR(op->owner_module);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->owner_self);
+        Py_CLEAR(op->ret_cls);
+    }
+    return 0;
+}
+
+static void async_op_dealloc(PyObject *self) {
+    PyObject_GC_UnTrack(self);
+    PyTypeObject *cls = Py_TYPE(self);
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData(self, cls);
+    if (op) {
+        async_op_cleanup_native(op, 0, op->abandoned_on_worker);
+        Py_CLEAR(op->owner_module);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->owner_self);
+        Py_CLEAR(op->ret_cls);
+        if (op->lock_ready) {
+            pthread_mutex_destroy(&op->mu);
+            op->lock_ready = 0;
+        }
+    }
+    freefunc tp_free = (freefunc)PyType_GetSlot(cls, Py_tp_free);
+    if (tp_free) {
+        tp_free(self);
+    }
+    Py_DECREF(cls);
+}
+
+static PyMethodDef async_op_methods[] = {
+    { "_on_fut_done", async_op_on_fut_done, METH_O, NULL },
+    { "_deliver", async_op_deliver, METH_NOARGS, NULL },
+    { NULL, NULL, 0, NULL }
+};
+
+static PyType_Slot async_op_slots[] = {
+    { Py_tp_methods, async_op_methods },
+    { Py_tp_traverse, async_op_traverse },
+    { Py_tp_clear, async_op_clear },
+    { Py_tp_dealloc, async_op_dealloc },
+    { 0, NULL }
+};
+
+static PyType_Spec async_op_spec = {
+    .name = "noxpy._AsyncOp",
+    .basicsize = -(int)sizeof(NoxPyAsyncOp),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC | Py_TPFLAGS_IMMUTABLETYPE,
+    .slots = async_op_slots,
+};
+
+int noxpy_async_init_module(PyObject *module, NoxPyModuleState *st) {
+    if (!module || !st) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid state for async init");
+        return -1;
+    }
+    if (st->async_op_type) {
+        return 0;
+    }
+    st->async_op_type = PyType_FromModuleAndSpec(module, &async_op_spec, NULL);
+    return st->async_op_type ? 0 : -1;
+}
+
+int noxpy_async_op_prepare(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    int owns_ctx,
+    NoxPyObjectData *owner_obj_data,
+    PyObject *owner_self,
+    const char *return_type,
+    const char *return_marshal,
+    PyObject *ret_cls,
+    uint64_t ret_tag,
+    uint8_t ret_policy,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs,
+    const NoxHostExternalRef *kept_extrefs,
+    size_t n_kept_extrefs,
+    NoxPyAsyncOp **out_op,
+    PyObject **out_future) {
+    if (!module || !ops || !ctx || !out_op || !out_future) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: invalid null argument to noxpy_async_op_prepare");
+        return -1;
+    }
+    *out_op = NULL;
+    *out_future = NULL;
+
+    NoxPyModuleState *st = (NoxPyModuleState *)PyModule_GetState(module);
+    if (!st || !st->async_op_type) {
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: module async runtime is not initialized");
+        return -1;
+    }
+
+    PyObject *asyncio_mod = PyImport_ImportModule("asyncio");
+    if (!asyncio_mod) {
+        return -1;
+    }
+    PyObject *get_loop_fn = PyObject_GetAttrString(asyncio_mod, "get_running_loop");
+    Py_DECREF(asyncio_mod);
+    if (!get_loop_fn) {
+        return -1;
+    }
+    PyObject *loop = PyObject_CallNoArgs(get_loop_fn);
+    Py_DECREF(get_loop_fn);
+    if (!loop) {
+        return -1;
+    }
+    PyObject *create_fut_fn = PyObject_GetAttrString(loop, "create_future");
+    if (!create_fut_fn) {
+        Py_DECREF(loop);
+        return -1;
+    }
+    PyObject *fut = PyObject_CallNoArgs(create_fut_fn);
+    Py_DECREF(create_fut_fn);
+    if (!fut) {
+        Py_DECREF(loop);
+        return -1;
+    }
+
+    PyTypeObject *cls = (PyTypeObject *)st->async_op_type;
+    allocfunc tp_alloc = (allocfunc)PyType_GetSlot(cls, Py_tp_alloc);
+    if (!tp_alloc) {
+        Py_DECREF(fut);
+        Py_DECREF(loop);
+        PyErr_SetString(PyExc_SystemError, "noxpy: async op type missing Py_tp_alloc");
+        return -1;
+    }
+    PyObject *op_obj = tp_alloc(cls, 0);
+    if (!op_obj) {
+        Py_DECREF(fut);
+        Py_DECREF(loop);
+        return -1;
+    }
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)PyObject_GetTypeData(op_obj, cls);
+    if (!op) {
+        Py_DECREF(op_obj);
+        Py_DECREF(fut);
+        Py_DECREF(loop);
+        PyErr_SetString(PyExc_SystemError, "noxpy: async op missing type data");
+        return -1;
+    }
+    memset(op, 0, sizeof(*op));
+    if (pthread_mutex_init(&op->mu, NULL) != 0) {
+        Py_DECREF(op_obj);
+        Py_DECREF(fut);
+        Py_DECREF(loop);
+        PyErr_SetString(PyExc_RuntimeError, "noxpy: failed to init async op mutex");
+        return -1;
+    }
+    op->lock_ready = 1;
+    op->self_obj = op_obj;
+    op->owner_module = Py_NewRef(module);
+    op->loop = loop;
+    op->fut = fut;
+    op->owner_self = owner_self ? Py_NewRef(owner_self) : NULL;
+    op->ret_cls = ret_cls ? Py_NewRef(ret_cls) : NULL;
+    op->host_ops = ops;
+    op->ext_refs = extref_table_retain(st->ext_refs);
+    op->ctx = ctx;
+    op->owns_ctx = owns_ctx;
+    op->owner_obj_data = NULL;
+    op->ret_type = dup_cstr(return_type ? return_type : "None");
+    op->ret_marshal = dup_cstr(return_marshal ? return_marshal : "none");
+    op->ret_tag = ret_tag;
+    op->ret_policy = ret_policy;
+    atomic_store_explicit(&op->cleaned, 0, memory_order_relaxed);
+
+    if (custom_excs && n_custom_excs > 0) {
+        op->custom_excs = (NoxPyCustomExc *)calloc(n_custom_excs, sizeof(NoxPyCustomExc));
+        if (!op->custom_excs) {
+            Py_DECREF(op_obj);
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(op->custom_excs, custom_excs, n_custom_excs * sizeof(NoxPyCustomExc));
+        op->n_custom_excs = n_custom_excs;
+    }
+    if (kept_extrefs && n_kept_extrefs > 0) {
+        op->kept_extrefs = (NoxHostExternalRef *)calloc(n_kept_extrefs, sizeof(NoxHostExternalRef));
+        if (!op->kept_extrefs) {
+            Py_DECREF(op_obj);
+            PyErr_NoMemory();
+            return -1;
+        }
+        memcpy(op->kept_extrefs, kept_extrefs, n_kept_extrefs * sizeof(NoxHostExternalRef));
+        op->n_kept_extrefs = n_kept_extrefs;
+    }
+
+    PyObject *on_fut_cb = PyObject_GetAttrString(op_obj, "_on_fut_done");
+    PyObject *add_cb_fn = on_fut_cb ? PyObject_GetAttrString(fut, "add_done_callback") : NULL;
+    PyObject *add_res = (on_fut_cb && add_cb_fn) ? PyObject_CallFunctionObjArgs(add_cb_fn, on_fut_cb, NULL) : NULL;
+    Py_XDECREF(add_res);
+    Py_XDECREF(add_cb_fn);
+    Py_XDECREF(on_fut_cb);
+    if (!add_res) {
+        Py_DECREF(op_obj);
+        return -1;
+    }
+
+    if (!owns_ctx && owner_obj_data) {
+        op->owner_obj_data = owner_obj_data;
+        obj_async_begin(owner_obj_data);
+    }
+
+    /* Extra ref held by the `noxpy_async_on_done` worker callback until it fires. */
+    Py_INCREF(op_obj);
+    *out_op = op;
+    *out_future = fut;
+    return 0;
+}
+
+void noxpy_async_on_done(
+    void *user_data, NoxHostContext *ctx, NoxHostTask task, NoxHostStatus final_status) {
+    (void)ctx;
+    NoxPyAsyncOp *op = (NoxPyAsyncOp *)user_data;
+    if (!op) {
+        return;
+    }
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    PyObject *op_obj = op->self_obj;
+    if (op->lock_ready) {
+        pthread_mutex_lock(&op->mu);
+        op->task = task;
+        op->task_known = 1;
+        op->final_status = final_status;
+        pthread_mutex_unlock(&op->mu);
+    }
+    PyObject *deliver_cb = PyObject_GetAttrString(op_obj, "_deliver");
+    PyObject *call_soon = deliver_cb && op->loop ? PyObject_GetAttrString(op->loop, "call_soon_threadsafe") : NULL;
+    PyObject *res = (deliver_cb && call_soon) ? PyObject_CallFunctionObjArgs(call_soon, deliver_cb, NULL) : NULL;
+    Py_XDECREF(call_soon);
+    Py_XDECREF(deliver_cb);
+    if (!res) {
+        PyErr_Clear();
+        const NoxPyHostOps *ops = op->host_ops;
+        if (ops && op->ctx && task != 0) {
+            NoxHostValue rv = 0;
+            NoxHostError *rerr = NULL;
+            if (ops->task_take_result && ops->task_take_result(op->ctx, task, &rv, &rerr) == NOX_HOST_OK) {
+                if (rv && ops->value_release) {
+                    (void)ops->value_release(op->ctx, rv);
+                }
+            }
+            if (rerr && ops->error_release) {
+                ops->error_release(rerr);
+            }
+            if (ops->task_release) {
+                (void)ops->task_release(op->ctx, task);
+            }
+            op->task = 0;
+        }
+        /* Do NOT call context_destroy inside worker thread (`nox_host.h:174` joins self). */
+        op->abandoned_on_worker = 1;
+        async_op_cleanup_native(op, 0, 1);
+    } else {
+        Py_DECREF(res);
+    }
+    Py_DECREF(op_obj); /* release worker ref from prepare */
+    PyGILState_Release(gstate);
+}
+
+PyObject *noxpy_async_op_finish_start(
+    NoxPyAsyncOp *op, NoxHostStatus start_rc, NoxHostTask task, NoxHostError *err) {
+    if (!op || !op->self_obj) {
+        PyErr_SetString(PyExc_SystemError, "noxpy: NULL async op in finish_start");
+        return NULL;
+    }
+    PyObject *op_obj = op->self_obj;
+    if (start_rc != NOX_HOST_OK || task == 0) {
+        NoxHostStatus mapped_rc = start_rc == NOX_HOST_OK ? NOX_HOST_ERR_STATE : start_rc;
+        set_exception_from_host_tbl(
+            op->ext_refs, op->host_ops, mapped_rc, err, op->custom_excs, op->n_custom_excs);
+        /* Worker on_done will never run; undo worker ref, clean up native state, drop caller ref. */
+        Py_DECREF(op_obj);
+        async_op_cleanup_native(op, 1, 0);
+        Py_CLEAR(op->fut);
+        Py_CLEAR(op->loop);
+        Py_CLEAR(op->owner_self);
+        Py_DECREF(op_obj);
+        return NULL;
+    }
+    if (op->lock_ready) {
+        pthread_mutex_lock(&op->mu);
+        op->task = task;
+        op->task_known = 1;
+        pthread_mutex_unlock(&op->mu);
+    }
+    PyObject *fut_ret = Py_NewRef(op->fut);
+    Py_DECREF(op_obj); /* drop caller ref from prepare; kept alive by on_done & fut callback */
+    return fut_ret;
 }

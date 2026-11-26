@@ -220,6 +220,108 @@ class TestIR(unittest.TestCase):
             parse_upstream_metadata_json(bad_async)
         self.assertEqual(ctx_a.exception.code, "NPY-E-TYPE")
 
+    def test_accepts_phase4_callbacks_async_and_iterators(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "compiler": {"name": "noxc", "version": "2.2.92", "commit": "00000000"},
+            "module": {"name": "pkg._p4", "source": "src/p4.nox"},
+            "exports": [
+                {
+                    "kind": "function",
+                    "id": "pkg::apply",
+                    "name": "apply",
+                    "c_symbol": "nox_host_export_p4_apply",
+                    "thread_policy": "parallel",
+                    "is_async": False,
+                    "params": [
+                        {"name": "cb", "type": "HostObject", "marshal": "external_ref", "has_default": False},
+                        {"name": "xs", "type": "list[HostObject]", "marshal": "value", "has_default": False},
+                    ],
+                    "return_marshal": "external_ref",
+                    "return_type": "HostObject",
+                    "doc": None,
+                    "span": {"file": "src/p4.nox", "line": 1, "column": 1},
+                },
+                {
+                    "kind": "function",
+                    "id": "pkg::async_add",
+                    "name": "async_add",
+                    "c_symbol": "nox_host_export_p4_async_add",
+                    "thread_policy": "parallel",
+                    "is_async": True,
+                    "params": [
+                        {"name": "a", "type": "int", "marshal": "scalar", "has_default": False},
+                    ],
+                    "return_marshal": "scalar",
+                    "return_type": "int",
+                    "doc": None,
+                    "span": {"file": "src/p4.nox", "line": 4, "column": 1},
+                },
+                {
+                    "kind": "class",
+                    "id": "pkg::RangeIter",
+                    "name": "RangeIter",
+                    "doc": None,
+                    "thread_policy": "instance_locked",
+                    "span": {"file": "src/p4.nox", "line": 8, "column": 1},
+                    "constructor": {
+                        "c_symbol": "nox_host_export_p4_RangeIter___new__",
+                        "params": [],
+                        "doc": None,
+                    },
+                    "methods": [
+                        {
+                            "name": "__iter__",
+                            "method_kind": "dunder",
+                            "has_self": True,
+                            "c_symbol": "nox_host_export_p4_RangeIter___iter__",
+                            "thread_policy": "instance_locked",
+                            "is_async": False,
+                            "params": [],
+                            "return_marshal": "handle",
+                            "return_type": "RangeIter",
+                            "doc": None,
+                            "span": {"file": "src/p4.nox", "line": 10, "column": 1},
+                        },
+                        {
+                            "name": "__next__",
+                            "method_kind": "dunder",
+                            "has_self": True,
+                            "c_symbol": "nox_host_export_p4_RangeIter___next__",
+                            "thread_policy": "instance_locked",
+                            "is_async": False,
+                            "params": [],
+                            "return_marshal": "scalar",
+                            "return_type": "int",
+                            "doc": None,
+                            "span": {"file": "src/p4.nox", "line": 13, "column": 1},
+                        },
+                        {
+                            "name": "later",
+                            "method_kind": "instance",
+                            "has_self": True,
+                            "c_symbol": "nox_host_export_p4_RangeIter_later",
+                            "thread_policy": "instance_locked",
+                            "is_async": True,
+                            "params": [],
+                            "return_marshal": "scalar",
+                            "return_type": "int",
+                            "doc": None,
+                            "span": {"file": "src/p4.nox", "line": 16, "column": 1},
+                        },
+                    ],
+                },
+            ],
+        }
+        ir = parse_upstream_metadata_json(manifest, expected_module_name="pkg._p4")
+        self.assertEqual([fn.name for fn in ir.functions], ["apply", "async_add"])
+        self.assertFalse(ir.functions[0].is_async)
+        self.assertTrue(ir.functions[1].is_async)
+        self.assertEqual(ir.functions[0].params[0].marshal, "external_ref")
+        self.assertEqual(ir.functions[0].params[1].marshal, "value")
+        self.assertEqual([m.name for m in ir.classes[0].methods], ["__iter__", "__next__", "later"])
+        self.assertTrue(ir.classes[0].methods[2].is_async)
+
 
 if __name__ == "__main__":
     unittest.main()

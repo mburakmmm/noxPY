@@ -22,7 +22,7 @@ OPTIONAL_SCALAR_ONLY_CONTAINERS = frozenset({"int", "float", "bool"})
 PARAM_KINDS = frozenset({"positional_only", "positional_or_keyword", "keyword_only"})
 THREAD_POLICIES = frozenset({"parallel", "instance_locked", "thread_affine"})
 METHOD_KINDS = frozenset({"instance", "staticmethod", "classmethod", "property_get", "property_set", "dunder"})
-SUPPORTED_DUNDERS = frozenset({"__repr__", "__str__", "__len__", "__enter__", "__exit__"})
+SUPPORTED_DUNDERS = frozenset({"__repr__", "__str__", "__len__", "__iter__", "__next__", "__enter__", "__exit__"})
 STANDARD_EXCEPTION_BASES = frozenset(
     {
         "Exception",
@@ -96,6 +96,7 @@ class ExportedFunctionIR:
     doc: str | None
     thread_policy: str
     span: SourceSpan
+    is_async: bool = False
 
 
 @dataclass(frozen=True)
@@ -235,6 +236,8 @@ def _classify_type_impl(
         return "scalar"
     if t in ("str", "bytes"):
         return "span"
+    if t == "HostObject":
+        return "value" if in_container else "external_ref"
     if not in_container and t in known_classes:
         return "handle"
 
@@ -689,10 +692,11 @@ def parse_upstream_metadata_json(
                     raise NoxPyError(
                         "NPY-E-TYPE", f"Unsupported method_kind {mkind!r} on class {name!r}", location=mloc
                     )
-                if bool(m_raw.get("is_async", False)):
+                is_async = bool(m_raw.get("is_async", False))
+                if is_async and mkind != "instance":
                     raise NoxPyError(
                         "NPY-E-TYPE",
-                        f"Async method {m_raw.get('name')!r} on {name!r} requires Phase 4 (UR-011)",
+                        f"Async method {m_raw.get('name')!r} on {name!r} is only supported on plain instance methods, not {mkind!r}",
                         location=mloc,
                     )
 
@@ -772,7 +776,15 @@ def parse_upstream_metadata_json(
                         raise NoxPyError(
                             "NPY-E-TYPE", f"{m_owner} must take 0 args and return int", location=mloc
                         )
-                elif mkind == "instance" and ret_marshal == "handle":
+                    if mname == "__iter__" and (len(mparams) != 0 or ret_ty == "None" or ret_marshal not in ("handle", "value")):
+                        raise NoxPyError(
+                            "NPY-E-TYPE", f"{m_owner} must take 0 args and return an iterator handle/object", location=mloc
+                        )
+                    if mname == "__next__" and (len(mparams) != 0 or ret_ty == "None"):
+                        raise NoxPyError(
+                            "NPY-E-TYPE", f"{m_owner} must take 0 args and return a non-None element type", location=mloc
+                        )
+                elif mkind == "instance" and ret_marshal == "handle" and not is_async:
                     raise NoxPyError(
                         "NPY-E-TYPE",
                         f"Instance method {m_owner} returning class handle is not supported yet (use @staticmethod/@classmethod or top-level factory)",
@@ -791,7 +803,7 @@ def parse_upstream_metadata_json(
                         return_marshal=ret_marshal,
                         doc=mdoc,
                         thread_policy=mpol,
-                        is_async=False,
+                        is_async=is_async,
                         span=mspan,
                     )
                 )
@@ -864,6 +876,7 @@ def parse_upstream_metadata_json(
             entry.get("params"), owner_name=name, loc=loc, known_classes=known_classes
         )
         doc = _validate_doc(entry.get("doc"), name, loc)
+        fn_is_async = bool(entry.get("is_async", False))
 
         functions.append(
             ExportedFunctionIR(
@@ -876,6 +889,7 @@ def parse_upstream_metadata_json(
                 doc=doc,
                 thread_policy=thread_policy,
                 span=span,
+                is_async=fn_is_async,
             )
         )
 

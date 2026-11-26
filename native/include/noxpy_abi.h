@@ -81,7 +81,20 @@ typedef struct NoxPyHostOps {
     NoxHostStatus (*handle_release)(NoxHostContext *ctx, NoxHostHandle h);
     int32_t (*handle_is_valid)(NoxHostContext *ctx, NoxHostHandle h);
     NoxHostStatus (*handle_type_name)(NoxHostContext *ctx, NoxHostHandle h, NoxHostSpan *out);
+    NoxHostStatus (*value_get_handle)(NoxHostContext *ctx, NoxHostValue v, NoxHostHandle *out);
+    /* ---- ABI v3 (UR-010) external refs & reentrant callbacks ---- */
+    NoxHostStatus (*context_set_callbacks)(NoxHostContext *ctx, const NoxHostCallbackOps *ops);
+    uint64_t (*error_host_token)(const NoxHostError *err);
+    NoxHostStatus (*value_external_ref)(NoxHostContext *ctx, NoxHostExternalRef ref, NoxHostValue *out);
+    NoxHostStatus (*value_get_external_ref)(NoxHostContext *ctx, NoxHostValue v, NoxHostExternalRef *out);
+    /* ---- ABI v3 (UR-011) async tasks ---- */
+    NoxHostStatus (*task_cancel)(NoxHostContext *ctx, NoxHostTask task);
+    NoxHostStatus (*task_take_result)(
+        NoxHostContext *ctx, NoxHostTask task, NoxHostValue *out_val, NoxHostError **out_err);
+    NoxHostStatus (*task_release)(NoxHostContext *ctx, NoxHostTask task);
 } NoxPyHostOps;
+
+typedef struct NoxPyExtRefTable NoxPyExtRefTable;
 
 /*
  * Interpreter-local per-module state stored in CPython module state (`PyModule_GetState`).
@@ -98,6 +111,8 @@ typedef struct NoxPyModuleState {
     atomic_flag pool_lock;
     size_t pool_count;
     NoxHostContext *pool[NOXPY_CTX_POOL_CAP];
+    NoxPyExtRefTable *ext_refs;
+    PyObject *async_op_type;
 } NoxPyModuleState;
 
 /*
@@ -253,10 +268,13 @@ PyObject *noxpy_host_value_to_py(
 #define NOXPY_POLICY_INSTANCE_LOCKED 1u
 #define NOXPY_POLICY_THREAD_AFFINE 2u
 
+typedef struct NoxPySharedCtx NoxPySharedCtx;
+
 typedef struct NoxPyObjectData {
     PyObject *owner_module;
     const NoxPyHostOps *host_ops;
     NoxHostContext *owner_ctx;
+    NoxPySharedCtx *shared_ctx;
     NoxHostHandle handle;
     uint64_t type_tag;
     uint64_t instance_gen;
@@ -266,11 +284,84 @@ typedef struct NoxPyObjectData {
     uint8_t initialized;
     uint8_t lock_ready;
     pthread_mutex_t lock;
+    _Atomic uint32_t pending_async;
+    _Atomic uint8_t has_deferred_close;
+    NoxPySharedCtx *deferred_sc;
+    NoxHostHandle deferred_handle;
 } NoxPyObjectData;
 
 uint64_t noxpy_current_tid(void);
 int noxpy_host_context_create_and_init(const NoxPyHostOps *ops, NoxHostContext **out_ctx);
 void noxpy_host_context_fini_and_destroy(const NoxPyHostOps *ops, NoxHostContext *ctx);
+int noxpy_host_context_create_for_module(
+    PyObject *module, const NoxPyHostOps *ops, NoxHostContext **out_ctx);
+
+/*
+ * Phase 4 (0.4) Module GC hooks, HostObject ExternalRef table, Reentrant Callbacks & Async Futures.
+ */
+PyObject *noxpy_obj_new_from_shared_handle(
+    PyTypeObject *cls,
+    PyObject *owner_module,
+    NoxPySharedCtx *shared_ctx,
+    NoxHostHandle handle,
+    uint64_t type_tag,
+    uint8_t thread_policy);
+int noxpy_module_state_init_mod(PyObject *module, NoxPyModuleState *st, const NoxPyHostOps *ops);
+int noxpy_module_state_traverse(NoxPyModuleState *st, visitproc visit, void *arg);
+int noxpy_module_state_clear(NoxPyModuleState *st);
+int noxpy_context_install_callbacks(PyObject *module, const NoxPyHostOps *ops, NoxHostContext *ctx);
+
+NoxHostExternalRef noxpy_extref_intern(PyObject *module, PyObject *obj);
+PyObject *noxpy_extref_take_returned(PyObject *module, NoxHostExternalRef ref);
+void noxpy_extref_release_token(PyObject *module, NoxHostExternalRef ref);
+
+int noxpy_py_to_host_value_ex(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    PyObject *obj,
+    const char *type_spec,
+    NoxHostValue *out_val,
+    const char *arg_name);
+PyObject *noxpy_host_value_to_py_ex(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    NoxHostValue val);
+
+void noxpy_set_exception_from_host_mod(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostStatus status,
+    NoxHostError *err,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs);
+int noxpy_error_is_stop_iteration(const NoxPyHostOps *ops, const NoxHostError *err);
+
+int noxpy_async_init_module(PyObject *module, NoxPyModuleState *st);
+
+typedef struct NoxPyAsyncOp NoxPyAsyncOp;
+int noxpy_async_op_prepare(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    int owns_ctx,
+    NoxPyObjectData *owner_obj_data,
+    PyObject *owner_self,
+    const char *return_type,
+    const char *return_marshal,
+    PyObject *ret_cls,
+    uint64_t ret_tag,
+    uint8_t ret_policy,
+    const NoxPyCustomExc *custom_excs,
+    size_t n_custom_excs,
+    const NoxHostExternalRef *kept_extrefs,
+    size_t n_kept_extrefs,
+    NoxPyAsyncOp **out_op,
+    PyObject **out_future);
+void noxpy_async_on_done(
+    void *user_data, NoxHostContext *ctx, NoxHostTask task, NoxHostStatus final_status);
+PyObject *noxpy_async_op_finish_start(NoxPyAsyncOp *op, NoxHostStatus start_rc, NoxHostTask task, NoxHostError *err);
 
 int noxpy_obj_init(
     NoxPyObjectData *data,

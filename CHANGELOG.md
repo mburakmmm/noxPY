@@ -6,6 +6,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.4.0a1] — 2026-11-26 (Phase 4 Core Alpha: Callbacks, Async/Await & Iterators)
+
+### Added (Phase 4 Core — `noxc v2.2.92` & Host ABI `v3-rc`)
+- Synchronized [`native/include/nox_host.h`](native/include/nox_host.h) and [`python/noxpy/_native/include/nox_host.h`](python/noxpy/_native/include/nox_host.h) to `nox-lang v2.2.92` (`NOX_HOST_ABI_VERSION = 3u`, `UR-010` reentrant callback lock + `UR-011` async tasks).
+- Added managed `HostObject` / `PyObject` handle runtime (`NoxPyExtRefTable`, generation-checked `NoxHostExternalRef`, `PyGILState_Ensure`/`Release` callback invoke/retain/release) in [`native/include/noxpy_abi.h`](native/include/noxpy_abi.h) and [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c), preserving original Python exceptions across `NOX_HOST_ERR_HOST_EXCEPTION` (`nox_host_error_host_token`).
+- Implemented native `asyncio.Future` bridge (`_AsyncOp`, `noxpy_async_init_module`, `noxpy_async_op_prepare`, `noxpy_async_on_done`, `noxpy_async_op_finish_start`) with `loop.call_soon_threadsafe` delivery, cooperative cancellation (`nox_host_task_cancel` -> `asyncio.CancelledError`), scheduler deadlock containment (`RuntimeError`), and deferred instance close (`pending_async`/`has_deferred_close`).
+- Added iterator protocol (`__iter__` -> `Py_tp_iter`, `__next__` -> `Py_tp_iternext`) with reference-counted `NoxPySharedCtx` sharing and clean `StopIteration` vs domain exception separation (`noxpy_error_is_stop_iteration`), plus updated `abi3t` symbol allowlist in [`python/noxpy/audit.py`](python/noxpy/audit.py).
+- Extended Binding IR ([`python/noxpy/ir.py`](python/noxpy/ir.py)) and `.pyi` + C codegen ([`python/noxpy/codegen.py`](python/noxpy/codegen.py)) for `HostObject` (`external_ref` & container `value`), `@export async def` + async plain instance methods, `async def` stubs, and iterator dunders.
+- Shipped [`examples/callbacks_async/`](examples/callbacks_async/) (`apply_twice`, `async_add`, `async_with_cb`, `async_slow`, `async_stuck`, `AsyncWorker`, `RangeIter`, `RangeSeq`, `FailingIter`), end-to-end dual-mode tests in [`tests/packaging/test_phase4_callbacks_async.py`](tests/packaging/test_phase4_callbacks_async.py), CI `v2.2.92` toolchain matrix ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)), and [`docs/evidence/phase4-2026-11-26.md`](docs/evidence/phase4-2026-11-26.md).
+- Subinterpreter isolation (`Py_mod_multiple_interpreters`) remains conservatively set to `Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED` pending `nox-lang v2.2.93` (`UR-013`).
+
 ## [0.3.0a1] — 2026-11-26 (Phase 3 Alpha: Native Classes, Properties, Exceptions & Concurrency)
 
 ### Added (Phase 3 — `noxc v2.2.90` & Host ABI `v3-rc`)

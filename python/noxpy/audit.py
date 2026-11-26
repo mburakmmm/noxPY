@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyArg_CheckPositional",
         "PyBool_FromLong",
         "PyBool_Type",
+        "PyBuffer_IsContiguous",
+        "PyBuffer_Release",
         "PyBytes_AsStringAndSize",
         "PyBytes_FromStringAndSize",
         "PyDict_GetItemStringRef",
@@ -37,6 +40,7 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyEval_SaveThread",
         "PyExc_AssertionError",
         "PyExc_AttributeError",
+        "PyExc_BufferError",
         "PyExc_Exception",
         "PyExc_IndexError",
         "PyExc_KeyError",
@@ -56,6 +60,8 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyGILState_Ensure",
         "PyGILState_Release",
         "PyImport_ImportModule",
+        "PyInterpreterState_Get",
+        "PyInterpreterState_GetID",
         "PyList_New",
         "PyList_SetItem",
         "PyList_Size",
@@ -63,13 +69,16 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyLong_AsInt64",
         "PyLong_FromInt64",
         "PyLong_Type",
+        "PyMemoryView_FromObject",
         "PyModule_AddObjectRef",
         "PyModule_GetState",
         "PyObject_Call",
         "PyObject_CallFunctionObjArgs",
         "PyObject_CallNoArgs",
+        "PyObject_CheckBuffer",
         "PyObject_GC_UnTrack",
         "PyObject_GetAttrString",
+        "PyObject_GetBuffer",
         "PyObject_GetTypeData",
         "PyObject_GetTypeData_DuringGC",
         "PyObject_HashNotImplemented",
@@ -175,11 +184,40 @@ def _audit_linux(so_path: Path, expected_symbol: str, loc: DiagnosticLocation) -
         if line.strip()
     ]
     undefs = []
+    max_glibc_raw = os.environ.get("NOXPY_MAX_GLIBC", "").strip()
+    max_glibc: tuple[int, ...] | None = None
+    if max_glibc_raw:
+        try:
+            max_glibc = tuple(int(p) for p in max_glibc_raw.split("."))
+        except ValueError as exc:
+            raise NoxPyError(
+                "NPY-E-CONFIG",
+                f"Invalid NOXPY_MAX_GLIBC version specifier: {max_glibc_raw!r}",
+                location=loc,
+            ) from exc
+
+    bad_glibc: list[str] = []
     for line in _run_tool(["nm", "-D", "-u", str(so_path)], loc).splitlines():
         if not line.strip():
             continue
-        tok = line.strip().split()[-1].split("@", 1)[0]
+        raw_tok = line.strip().split()[-1]
+        if "@GLIBC_" in raw_tok and max_glibc is not None:
+            ver_str = raw_tok.split("@GLIBC_", 1)[1].lstrip("@")
+            try:
+                ver_tup = tuple(int(p) for p in ver_str.split("."))
+            except ValueError:
+                ver_tup = ()
+            if ver_tup and ver_tup > max_glibc:
+                bad_glibc.append(f"{raw_tok} (> GLIBC_{max_glibc_raw})")
+        tok = raw_tok.split("@", 1)[0]
         undefs.append(tok)
+
+    if bad_glibc:
+        raise NoxPyError(
+            "NPY-E-ABI",
+            f"Binary requires newer glibc symbols than allowed ({max_glibc_raw}): {bad_glibc[:8]}",
+            location=loc,
+        )
 
     py_c_syms = [s for s in undefs if s.startswith("Py") or s.startswith("_Py")]
 

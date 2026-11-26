@@ -1,0 +1,28 @@
+import nox.test
+from src.runtime.embed import EMBED_PROFILE_STATUS, EmbedProfile, validate_embed_profile
+
+nox.test.assert_eq_str(EMBED_PROFILE_STATUS, "experimental-deferred", "embed status")
+nox.test.assert_eq_str(
+    validate_embed_profile("cli_embed", "cp315-embed", True),
+    "gated:experimental-deferred",
+    "valid gated embed profile",
+)
+
+threw_abi3t: bool = False
+try:
+    _bad: str = validate_embed_profile("cli_embed", "abi3t", True)
+except ValueError:
+    threw_abi3t = True
+nox.test.assert_true(threw_abi3t, "abi3t must be rejected for standalone embed")
+
+threw_nolib: bool = False
+try:
+    _bad2: str = validate_embed_profile("cli_embed", "cp315-embed", False)
+except ValueError:
+    threw_nolib = True
+nox.test.assert_true(threw_nolib, "missing libpython must fail")
+
+prof: EmbedProfile = EmbedProfile("host_runner", "cp315-embed", True)
+nox.test.assert_eq_str(prof.summary(), "host_runner:cp315-embed:experimental-deferred", "profile summary")
+
+print("embed_test passed")

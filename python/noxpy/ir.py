@@ -18,6 +18,14 @@ HEX_RE = re.compile(r"^[0-9a-fA-F]*$")
 PHASE1_PARAM_TYPES = frozenset({"int", "float", "bool", "str", "bytes"})
 PHASE1_RETURN_TYPES = frozenset({"int", "float", "bool", "str", "bytes", "None"})
 DICT_KEY_TYPES = frozenset({"int", "float", "bool", "str", "bytes"})
+BUILTIN_BUFFER_TYPES = frozenset(
+    {
+        "nox_host_F64Buffer",
+        "nox_host_I64Buffer",
+        "nox_host_I32Buffer",
+        "nox_host_U8Buffer",
+    }
+)
 OPTIONAL_SCALAR_ONLY_CONTAINERS = frozenset({"int", "float", "bool"})
 PARAM_KINDS = frozenset({"positional_only", "positional_or_keyword", "keyword_only"})
 THREAD_POLICIES = frozenset({"parallel", "instance_locked", "thread_affine"})
@@ -238,7 +246,7 @@ def _classify_type_impl(
         return "span"
     if t == "HostObject":
         return "value" if in_container else "external_ref"
-    if not in_container and t in known_classes:
+    if not in_container and (t in known_classes or t in BUILTIN_BUFFER_TYPES):
         return "handle"
 
     if t.startswith("list[") and t.endswith("]"):
@@ -353,7 +361,7 @@ def _parse_params(
             loc=loc,
             known_classes=known_classes,
         )
-        if pmarshal == "handle":
+        if pmarshal == "handle" and ptype not in BUILTIN_BUFFER_TYPES:
             raise NoxPyError(
                 "NPY-E-TYPE",
                 f"Handle parameter {pname!r} ({ptype!r}) on {owner_name!r} is not supported across independent Phase 3 contexts",

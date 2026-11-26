@@ -1,10 +1,10 @@
 # UPSTREAM_REQUIREMENTS.md — Nox Compiler & Runtime Requirements for NoxPy
 
-> **Current Installed & CI-Verified Upstream Baseline:** `nox-lang v2.2.92` (`noxc 2.2.92`, upstream `v2.2.75`–`v2.2.92`; upstream `v2.2.93` release build pending)
+> **Current Installed & CI-Verified Upstream Baseline:** `nox-lang v2.2.95` (`noxc 2.2.95`, upstream `v2.2.75`–`v2.2.95`)
 > **Initial Observed Baseline (Historical):** `nox-lang v2.2.70` (commit `4dc061f8c8443f8575092c2652d1109b6f4697e9`)
 > **Installed Toolchain Verified (2026-11-26):**
-> - `noxc`: `/Users/melihburakmemis/.nox-lang/bin/noxc` (`noxc 2.2.92`, SHA-256: `f99216b25a14d2add5da32ade917ce3a34b7d5e41eea987331037bfeb98a3906`)
-> - `noxrt.o`: `/Users/melihburakmemis/.nox-lang/lib/noxrt.o` (SHA-256: `a2c7b66984b476a818ba45cf30c646ade124c973ff3febd3500161e0b0ca68fc`)
+> - `noxc`: `/Users/melihburakmemis/.nox-lang/bin/noxc` (`noxc 2.2.95`, SHA-256: `fd607819da6e536bd2e70e495af103f18b7c7c0debe47a59e874209f53d57829`)
+> - `noxrt.o`: `/Users/melihburakmemis/.nox-lang/lib/noxrt.o` (SHA-256: `dcf9e8f9d3c87374dda1f6eb229c83647c9230b30a22c3b6086f0e911b3a675a`)
 > - `nox_host.h`: `/Users/melihburakmemis/.nox-lang/include/nox_host.h` (`NOX_HOST_ABI_VERSION = 3u`, `v3-rc`)
 
 Per [`AGENTS.md`](AGENTS.md) §2 and §6, NoxPy tracks all compiler/runtime requirements needed from upstream `nox-lang` with executable verification scripts in [`tests/reproducers/`](tests/reproducers/).

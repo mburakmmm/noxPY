@@ -322,6 +322,47 @@ class TestIR(unittest.TestCase):
         self.assertEqual([m.name for m in ir.classes[0].methods], ["__iter__", "__next__", "later"])
         self.assertTrue(ir.classes[0].methods[2].is_async)
 
+    def test_accepts_phase5_builtin_buffers(self) -> None:
+        manifest = {
+            "schema_version": 1,
+            "compiler": {"name": "noxc", "version": "2.2.95", "commit": "2fd56280"},
+            "module": {"name": "pkg._p5", "source": "src/p5.nox"},
+            "exports": [
+                {
+                    "kind": "function",
+                    "id": "pkg::make_f64",
+                    "name": "make_f64",
+                    "c_symbol": "nox_host_export_p5_make_f64",
+                    "thread_policy": "parallel",
+                    "is_async": False,
+                    "params": [{"name": "n", "type": "int", "marshal": "scalar", "has_default": False}],
+                    "return_marshal": "handle",
+                    "return_type": "nox_host_F64Buffer",
+                    "doc": None,
+                    "span": {"file": "src/p5.nox", "line": 1, "column": 1},
+                },
+                {
+                    "kind": "function",
+                    "id": "pkg::sum_f64",
+                    "name": "sum_f64",
+                    "c_symbol": "nox_host_export_p5_sum_f64",
+                    "thread_policy": "parallel",
+                    "is_async": False,
+                    "params": [
+                        {"name": "b", "type": "nox_host_F64Buffer", "marshal": "handle", "has_default": False}
+                    ],
+                    "return_marshal": "scalar",
+                    "return_type": "float",
+                    "doc": None,
+                    "span": {"file": "src/p5.nox", "line": 4, "column": 1},
+                },
+            ],
+        }
+        ir = parse_upstream_metadata_json(manifest, expected_module_name="pkg._p5")
+        self.assertEqual([fn.name for fn in ir.functions], ["make_f64", "sum_f64"])
+        self.assertEqual(ir.functions[0].return_marshal, "handle")
+        self.assertEqual(ir.functions[1].params[0].marshal, "handle")
+
 
 if __name__ == "__main__":
     unittest.main()

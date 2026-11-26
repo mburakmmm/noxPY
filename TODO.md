@@ -92,23 +92,23 @@
 - [x] Support synchronous reentrant callbacks and safe worker-thread callback routing (`PyGILState_Ensure`, `NoxHostCallbackOps`, original Python exception restoration across `NOX_HOST_ERR_HOST_EXCEPTION`).
 - [x] Implement `asyncio.Future` async bridge (`@export async def` + `async` class methods, `loop.call_soon_threadsafe` completion, cooperative cancellation, deadlock `RuntimeError` containment, deferred instance close).
 - [x] Implement iterator protocol (`__iter__` / `__next__`, `NoxPySharedCtx` lifetime preservation, clean `StopIteration` vs domain exception distinction).
-- [ ] Prove subinterpreter isolation (`Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` or `SUPPORTED`), cross-interpreter rejection, and clean teardown (blocked until `nox-lang v2.2.93` `UR-013` ships in CI/toolchain).
+- [x] Prove subinterpreter isolation (`Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED`), cross-interpreter rejection (`owner_interp_id` checks on module lease, handle calls & buffers + `NOX_HOST_CAP_SUBINTERPRETERS`), and clean teardown across dual `3.15` / `3.15t` `concurrent.interpreters` tests on `noxc v2.2.95` (`UR-013`).
 
 ---
 
-## Phase 5 — `0.5`: Native Data, Buffers, and Atlas (Locked behind Phase 4)
-- [ ] Implement `src/buffer/` (`@pybuffer`): PEP 3118 `Py_buffer` protocol with owner pinning, readonly/exclusive writable checks, stride/overflow validation.
-- [ ] Implement optional NumPy adapter (`integrations/numpy/`) without polluting core ABI or re-enabling GIL.
-- [ ] Build benchmark harness (`benchmarks/`) reporting warmups, median, tail dispersion, scaling across 1/2/4/8 cores, and native vs Python/C baselines.
-- [ ] Integrate a real `Atlas` operation (`examples/atlas`) and prove zero-copy aliasing / copy semantics honestly.
+## Phase 5 — `0.5`: Native Data, Buffers, and Atlas (Verified on `noxc v2.2.95`)
+- [x] Implement `src/buffer/` (`F64Buffer`/`I64Buffer`/`I32Buffer`/`U8Buffer`): PEP 3118 `Py_buffer` protocol with owner pinning (`active_pins` + `NOX_HOST_ERR_BUSY`), readonly/exclusive `writable()` proxy checks, stride/overflow validation, and bulk `NOX_HOST_VALUE_TYPED_ARRAY` fast input path.
+- [x] Implement optional NumPy adapter (`integrations/numpy/`, `noxpy.numpy_adapter`) without polluting core ABI or re-enabling GIL.
+- [x] Build benchmark harness (`benchmarks/bench_phase5.py`) reporting warmups, median, IQR/p95/p99 tail dispersion, scaling across 1/2/4/8 cores, and native vs Python/C baselines.
+- [x] Integrate a real `Atlas` operation (`examples/atlas`) and prove zero-copy aliasing (`memoryview` + `writable()`) / single-copy (`TYPED_ARRAY`) semantics honestly.
 
 ---
 
-## Phase 6 — `0.6`: Arrow, Noxen, and Optional Embedding (Locked behind Phase 5)
-- [ ] Implement Arrow C Data / C Stream interface adapter (`integrations/arrow/`) with schema/offset/release validation.
-- [ ] Build realistic `Noxen` validation example (`examples/noxen`).
-- [ ] Evaluate and optionally implement gated standalone CPython embedding profile (`src/runtime/` embed surface, distinct non-`abi3t` profile).
-- [ ] Expand cross-platform CI matrix (P0: macOS arm64, Linux x86_64 `manylinux_2_28`, Windows x86_64; P1/P2/P3 only with execution evidence).
+## Phase 6 — `0.6`: Arrow, Noxen, Subinterpreters & Cross-Platform CI (Verified on `noxc v2.2.95`)
+- [x] Implement Arrow C Data / C Stream interface adapter ([`python/noxpy/arrow_adapter.py`](python/noxpy/arrow_adapter.py), [`integrations/arrow/`](integrations/arrow/)) with schema/offset/release validation and zero-copy PyCapsule PEP 3118 buffer pinning.
+- [x] Build realistic `Noxen` validation example ([`examples/noxen/`](examples/noxen/), `noxpy-noxen 0.6.0a1`) verified end-to-end across dual `3.15` / `3.15t` virtualenvs and concurrent subinterpreters.
+- [x] Evaluate and gate standalone CPython embedding profile ([`src/runtime/embed.nox`](src/runtime/embed.nox), [`ADR-0009`](docs/adr/0009-embedding-and-platform-matrix.md): explicit non-`abi3t` `cp315-embed` profile marked `experimental-deferred` to keep extension wheels `libpython`-free).
+- [x] Expand cross-platform CI matrix ([`.github/workflows/ci.yml`](.github/workflows/ci.yml): full native `abi3t` wheel E2E on `ubuntu-latest` + `macos-15`, plus `windows-latest` `noxc v2.2.95` toolchain smoke + `tests/nox` + `tests/unit`; full Windows `.pyd` wheel link & `manylinux_2_28` container wheel builds tracked for Phase 7 `1.0`).
 
 ---
 

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["noxpy>=0.4.0a1"]
+build-backend = "noxpy.build"
+
+[project]
+name = "noxpy-atlas"
+version = "0.5.0a1"
+description = "NoxPy Phase 5 Atlas-inspired native numerical & column analytics example with zero-copy PEP 3118 buffers and bulk TYPED_ARRAYs."
+requires-python = ">=3.15"
+
+[tool.noxpy]
+module-name = "atlas_demo"
+source = "src/lib.nox"
+backend = "llvm"
+abi = "abi3t"
+free-threaded = true
+generate-stubs = true

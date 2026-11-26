@@ -1,0 +1,43 @@
+# Experimental Gated Standalone CPython Embedding Profile (`AGENTS.md` §1, §20)
+#
+# Standalone embedding (`CPython` hosted inside a native Nox binary) MUST NEVER share
+# the default `abi3t` extension profile or force extension wheels to link `libpython`.
+# Embedding remains gated and deferred (`EMBED_PROFILE_STATUS = "experimental-deferred"`).
+
+EMBED_PROFILE_STATUS: str = "experimental-deferred"
+EMBED_PROFILE_ABI: str = "cp315-embed"
+EXTENSION_DEFAULT_ABI: str = "abi3t"
+
+
+class EmbedProfile:
+    name: str
+    abi: str
+    link_libpython: bool
+    status: str
+
+    def __init__(self, name: str, abi: str, link_libpython: bool) -> None:
+        self.name = name
+        self.abi = abi
+        self.link_libpython = link_libpython
+        self.status = EMBED_PROFILE_STATUS
+
+    def summary(self) -> str:
+        return self.name + ":" + self.abi + ":" + self.status
+
+
+def validate_embed_profile(name: str, abi: str, link_libpython: bool) -> str:
+    if len(name) == 0:
+        raise ValueError("NPY-E-CONFIG: embed profile name must not be empty")
+    if abi == "abi3" or abi == "abi3t":
+        raise ValueError(
+            "NPY-E-ABI: standalone embedding cannot use extension stable ABI ('"
+            + abi
+            + "'); use distinct '"
+            + EMBED_PROFILE_ABI
+            + "' profile"
+        )
+    if abi != EMBED_PROFILE_ABI:
+        raise ValueError("NPY-E-ABI: unsupported embed ABI '" + abi + "'")
+    if not link_libpython:
+        raise ValueError("NPY-E-CONFIG: standalone embed profile requires explicit libpython linkage")
+    return "gated:" + EMBED_PROFILE_STATUS

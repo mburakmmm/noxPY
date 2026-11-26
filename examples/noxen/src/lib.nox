@@ -1,0 +1,142 @@
+# Noxen-inspired native schema and record validation module built with NoxPy.
+# Uses only subinterpreter-safe stdlib primitives (`nox.strings`) per UR-013.
+
+import nox.strings
+
+
+@export
+class ValidationError(ValueError):
+    pass
+
+
+def _is_ascii_digit(b: int) -> bool:
+    return b >= 48 and b <= 57
+
+
+@export
+def is_valid_email(s: str) -> bool:
+    """Validate email address format using Nox string operations."""
+    if len(s) == 0 or nox.strings.contains(s, " "):
+        return False
+    parts: list[str] = nox.strings.split(s, "@")
+    if len(parts) != 2:
+        return False
+    local: str = parts[0]
+    domain: str = parts[1]
+    if len(local) == 0 or len(domain) < 3:
+        return False
+    dot: int = nox.strings.index_of(domain, ".")
+    if dot <= 0 or nox.strings.ends_with(domain, ".") or nox.strings.contains(domain, ".."):
+        return False
+    return True
+
+
+@export
+def is_valid_date(s: str) -> bool:
+    """Validate ISO-8601 calendar date YYYY-MM-DD."""
+    if len(s) != 10:
+        return False
+    if nox.strings.byte_at(s, 4) != 45 or nox.strings.byte_at(s, 7) != 45:
+        return False
+    i: int = 0
+    while i < 10:
+        if i != 4 and i != 7:
+            if not _is_ascii_digit(nox.strings.byte_at(s, i)):
+                return False
+        i += 1
+    y: int = int(s[0:4])
+    m: int = int(s[5:7])
+    d: int = int(s[8:10])
+    if y < 1 or m < 1 or m > 12 or d < 1:
+        return False
+    max_d: int = 31
+    if m == 4 or m == 6 or m == 9 or m == 11:
+        max_d = 30
+    elif m == 2:
+        is_leap: bool = (y % 4 == 0) and ((y % 100 != 0) or (y % 400 == 0))
+        max_d = 29 if is_leap else 28
+    return d <= max_d
+
+
+@export
+def is_valid_ipv4(s: str) -> bool:
+    """Validate dotted IPv4 quad with octets in 0..255 and no leading zeros."""
+    parts: list[str] = nox.strings.split(s, ".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        plen: int = len(part)
+        if plen == 0 or plen > 3:
+            return False
+        if plen > 1 and nox.strings.byte_at(part, 0) == 48:
+            return False
+        j: int = 0
+        while j < plen:
+            if not _is_ascii_digit(nox.strings.byte_at(part, j)):
+                return False
+            j += 1
+        octet: int = int(part)
+        if octet < 0 or octet > 255:
+            return False
+    return True
+
+
+@export
+class UserValidator:
+    """Stateful native record validator enforcing Noxen field rules safely per instance."""
+    min_age: int
+    max_age: int
+    required_domain: str
+    accepted: int
+    rejected: int
+
+    def __init__(self, min_age: int, max_age: int, required_domain: str) -> None:
+        if min_age < 0 or max_age > 150 or min_age > max_age:
+            raise ValueError("invalid age bounds for UserValidator")
+        self.min_age = min_age
+        self.max_age = max_age
+        self.required_domain = required_domain
+        self.accepted = 0
+        self.rejected = 0
+
+    def validate_record(self, email: str, signup_date: str, age: int, ip: str) -> dict[str, str]:
+        if not is_valid_email(email):
+            self.rejected = self.rejected + 1
+            raise ValidationError("email: invalid_email: malformed address")
+        if len(self.required_domain) > 0:
+            parts: list[str] = nox.strings.split(email, "@")
+            if parts[1] != self.required_domain:
+                self.rejected = self.rejected + 1
+                raise ValidationError("email: domain_mismatch: unexpected domain")
+        if not is_valid_date(signup_date):
+            self.rejected = self.rejected + 1
+            raise ValidationError("signup_date: invalid_date: expected YYYY-MM-DD")
+        if age < self.min_age or age > self.max_age:
+            self.rejected = self.rejected + 1
+            raise ValidationError("age: out_of_range: age out of configured bounds")
+        if not is_valid_ipv4(ip):
+            self.rejected = self.rejected + 1
+            raise ValidationError("ip: invalid_ipv4: invalid IPv4 address")
+        self.accepted = self.accepted + 1
+        return {
+            "email": email,
+            "signup_date": signup_date,
+            "ip": ip,
+            "status": "ok",
+        }
+
+    def validate_emails_batch(self, emails: list[str]) -> list[bool]:
+        out: list[bool] = []
+        for email in emails:
+            out.append(is_valid_email(email))
+        return out
+
+    def count_valid_ages(self, ages: list[int]) -> int:
+        cnt: int = 0
+        for a in ages:
+            if a >= self.min_age and a <= self.max_age:
+                cnt += 1
+        return cnt
+
+    def stats(self) -> tuple[int, int]:
+        return (self.accepted, self.rejected)

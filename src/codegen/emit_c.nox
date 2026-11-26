@@ -444,6 +444,11 @@ def generate_c_adapter(ir: ModuleIR) -> str:
         "    .task_cancel = nox_host_task_cancel,",
         "    .task_take_result = nox_host_task_take_result,",
         "    .task_release = nox_host_task_release,",
+        "    .handle_pin_buffer = nox_host_handle_pin_buffer,",
+        "    .buffer_unpin = nox_host_buffer_unpin,",
+        "    .value_typed_array = nox_host_value_typed_array,",
+        "    .value_get_typed_array = nox_host_value_get_typed_array,",
+        "    .capabilities = nox_host_capabilities,",
         "};",
         "",
     ]
@@ -488,7 +493,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
     lines.append("    PySlot_FUNC(Py_mod_exec, noxpy_exec_" + leaf + "),")
     lines.append("    PySlot_FUNC(Py_mod_state_free, noxpy_free_" + leaf + "),")
     lines.append("    PySlot_DATA(Py_mod_gil, Py_MOD_GIL_NOT_USED),")
-    lines.append("    PySlot_DATA(Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED),")
+    lines.append("    PySlot_DATA(Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED),")
     lines.append("    PySlot_END")
     lines.append("};")
     lines.append("")

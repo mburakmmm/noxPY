@@ -1,0 +1,84 @@
+# Typed buffer specification & PEP 3118 layout validation in genuine Nox (AGENTS.md §14, UR-012).
+
+from src.core.errors import NoxPyError
+
+__all__: list[str] = [
+    "BufferSpec",
+    "dtype_itemsize",
+    "dtype_pep3118_format",
+    "validate_contiguous_1d_spec",
+]
+
+
+class BufferSpec:
+    dtype: str
+    itemsize: int
+    format_char: str
+    length: int
+    byte_len: int
+    writable: bool
+
+    def __init__(
+        self,
+        dtype: str,
+        itemsize: int,
+        format_char: str,
+        length: int,
+        byte_len: int,
+        writable: bool,
+    ) -> None:
+        self.dtype = dtype
+        self.itemsize = itemsize
+        self.format_char = format_char
+        self.length = length
+        self.byte_len = byte_len
+        self.writable = writable
+
+
+def dtype_itemsize(dtype: str) -> int:
+    if dtype == "float64" or dtype == "int64" or dtype == "uint64":
+        return 8
+    if dtype == "float32" or dtype == "int32" or dtype == "uint32":
+        return 4
+    if dtype == "int16" or dtype == "uint16":
+        return 2
+    if dtype == "int8" or dtype == "uint8" or dtype == "bool":
+        return 1
+    raise NoxPyError("NPY-E-TYPE", "Unsupported buffer dtype: " + dtype, "", 0, 1, "")
+
+
+def dtype_pep3118_format(dtype: str) -> str:
+    if dtype == "float64":
+        return "d"
+    if dtype == "float32":
+        return "f"
+    if dtype == "int64":
+        return "q"
+    if dtype == "uint64":
+        return "Q"
+    if dtype == "int32":
+        return "i"
+    if dtype == "uint32":
+        return "I"
+    if dtype == "int16":
+        return "h"
+    if dtype == "uint16":
+        return "H"
+    if dtype == "int8":
+        return "b"
+    if dtype == "uint8":
+        return "B"
+    if dtype == "bool":
+        return "?"
+    raise NoxPyError("NPY-E-TYPE", "Unsupported buffer dtype: " + dtype, "", 0, 1, "")
+
+
+def validate_contiguous_1d_spec(dtype: str, length: int, writable: bool) -> BufferSpec:
+    if length < 0:
+        raise NoxPyError("NPY-E-TYPE", "Negative buffer length is invalid", "", 0, 1, "")
+    isz: int = dtype_itemsize(dtype)
+    max_items: int = 2147483647 // isz
+    if length > max_items:
+        raise NoxPyError("NPY-E-TYPE", "Buffer byte size overflows 32-bit safe limit", "", 0, 1, "")
+    fmt: str = dtype_pep3118_format(dtype)
+    return BufferSpec(dtype, isz, fmt, length, length * isz, writable)

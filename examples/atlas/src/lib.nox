@@ -1,0 +1,190 @@
+# Real Atlas numerical column analytics over UR-012 zero-copy buffers & bulk TYPED_ARRAYs.
+from nox.host import F64Buffer, I64Buffer, I32Buffer, U8Buffer
+
+
+def _neumaier_from_list(xs: list[float]) -> float:
+    sum_f: float = 0.0
+    c_comp: float = 0.0
+    has_pos_inf: bool = False
+    has_neg_inf: bool = False
+    pos_sample: float = 0.0
+    neg_sample: float = 0.0
+    for x in xs:
+        if not (x == x):
+            return x
+        if (x - x) != 0.0:
+            if x > 0.0:
+                has_pos_inf = True
+                pos_sample = x
+            else:
+                has_neg_inf = True
+                neg_sample = x
+        else:
+            t: float = sum_f + x
+            abs_sum: float = sum_f if sum_f >= 0.0 else -sum_f
+            abs_x: float = x if x >= 0.0 else -x
+            if abs_sum >= abs_x:
+                c_comp = c_comp + ((sum_f - t) + x)
+            else:
+                c_comp = c_comp + ((x - t) + sum_f)
+            sum_f = t
+    if has_pos_inf and has_neg_inf:
+        return pos_sample + neg_sample
+    if has_pos_inf:
+        return pos_sample
+    if has_neg_inf:
+        return neg_sample
+    return sum_f + c_comp
+
+
+@export
+def make_f64_column(n: int) -> F64Buffer:
+    b: F64Buffer = F64Buffer(n)
+    for i in range(n):
+        b.set(i, float(i))
+    return b
+
+
+@export
+def make_i64_column(n: int) -> I64Buffer:
+    return I64Buffer(n)
+
+
+@export
+def make_i32_column(n: int) -> I32Buffer:
+    return I32Buffer(n)
+
+
+@export
+def make_u8_column(n: int) -> U8Buffer:
+    return U8Buffer(n)
+
+
+@export
+def neumaier_sum_buf(b: F64Buffer) -> float:
+    """Atlas Neumaier compensated sum over zero-copy F64Buffer."""
+    return _neumaier_from_list(b.as_list())
+
+
+@export
+def welford_variance_buf(b: F64Buffer, ddof: int = 1) -> tuple[float, float]:
+    """Atlas online Welford (mean, variance) over F64Buffer."""
+    n: int = b.len()
+    if n <= ddof:
+        raise ValueError("welford_variance_buf requires len(b) > ddof")
+    mean: float = 0.0
+    m2: float = 0.0
+    k: int = 0
+    for i in range(n):
+        x: float = b.get(i)
+        if not (x == x) or (x - x) != 0.0:
+            raise ValueError("non-finite value in welford_variance_buf")
+        k = k + 1
+        delta: float = x - mean
+        mean = mean + delta / float(k)
+        delta2: float = x - mean
+        m2 = m2 + delta * delta2
+    return (mean, m2 / float(k - ddof))
+
+
+@export
+def moving_average_buf(b: F64Buffer, window: int) -> F64Buffer:
+    """Atlas simple moving average returning a fresh native F64Buffer."""
+    if window <= 0:
+        raise ValueError("window must be positive")
+    n: int = b.len()
+    out: F64Buffer = F64Buffer(n)
+    if n == 0:
+        return out
+    rolling: float = 0.0
+    for i in range(n):
+        rolling = rolling + b.get(i)
+        if i >= window:
+            rolling = rolling - b.get(i - window)
+            out.set(i, rolling / float(window))
+        else:
+            out.set(i, rolling / float(i + 1))
+    return out
+
+
+@export
+def scale_inplace_buf(b: F64Buffer, factor: float) -> None:
+    """Scale an F64Buffer in place inside Nox runtime."""
+    n: int = b.len()
+    for i in range(n):
+        b.set(i, b.get(i) * factor)
+
+
+@export
+def resize_buf(b: F64Buffer, n: int) -> None:
+    b.resize(n)
+
+
+@export
+def is_pinned_buf(b: F64Buffer) -> bool:
+    return b.is_pinned()
+
+
+@export
+def sum_i64_buf(b: I64Buffer) -> int:
+    total: int = 0
+    for x in b.as_list():
+        total = total + x
+    return total
+
+
+@export
+def sum_i32_buf(b: I32Buffer) -> int:
+    total: int = 0
+    for x in b.as_list():
+        total = total + int(x)
+    return total
+
+
+@export
+def sum_u8_buf(b: U8Buffer) -> int:
+    total: int = 0
+    for x in b.as_list():
+        total = total + int(x)
+    return total
+
+
+@export
+def neumaier_sum_bulk(xs: list[float]) -> float:
+    """Atlas Neumaier compensated sum accepting list[float] or bulk TYPED_ARRAY."""
+    return _neumaier_from_list(xs)
+
+
+@export
+def sum_ints(xs: list[int]) -> int:
+    """Checked 64-bit integer sum (raises OverflowError recoverably via UR-015)."""
+    total: int = 0
+    for x in xs:
+        total = total + x
+    return total
+
+
+@export
+def count_true(xs: list[bool]) -> int:
+    cnt: int = 0
+    for x in xs:
+        if x:
+            cnt = cnt + 1
+    return cnt
+
+
+@export
+def dot_f64_bulk(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        raise ValueError("dot_f64_bulk requires equal lengths")
+    acc: float = 0.0
+    comp: float = 0.0
+    for i in range(len(a)):
+        prod: float = a[i] * b[i]
+        t: float = acc + prod
+        if (acc if acc >= 0.0 else -acc) >= (prod if prod >= 0.0 else -prod):
+            comp = comp + ((acc - t) + prod)
+        else:
+            comp = comp + ((prod - t) + acc)
+        acc = t
+    return acc + comp

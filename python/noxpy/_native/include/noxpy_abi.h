@@ -11,7 +11,48 @@
 #endif
 
 #include <Python.h>
-#include <pthread.h>
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+typedef CRITICAL_SECTION noxpy_mutex_t;
+static inline int noxpy_mutex_init(noxpy_mutex_t *m) {
+    InitializeCriticalSection(m);
+    return 0;
+}
+static inline void noxpy_mutex_destroy(noxpy_mutex_t *m) {
+    DeleteCriticalSection(m);
+}
+static inline void noxpy_mutex_lock(noxpy_mutex_t *m) {
+    EnterCriticalSection(m);
+}
+static inline void noxpy_mutex_unlock(noxpy_mutex_t *m) {
+    LeaveCriticalSection(m);
+}
+static inline void noxpy_cpu_yield(void) {
+    SwitchToThread();
+}
+#else
+#  include <pthread.h>
+#  include <sched.h>
+typedef pthread_mutex_t noxpy_mutex_t;
+static inline int noxpy_mutex_init(noxpy_mutex_t *m) {
+    return pthread_mutex_init(m, NULL);
+}
+static inline void noxpy_mutex_destroy(noxpy_mutex_t *m) {
+    pthread_mutex_destroy(m);
+}
+static inline void noxpy_mutex_lock(noxpy_mutex_t *m) {
+    pthread_mutex_lock(m);
+}
+static inline void noxpy_mutex_unlock(noxpy_mutex_t *m) {
+    pthread_mutex_unlock(m);
+}
+static inline void noxpy_cpu_yield(void) {
+    sched_yield();
+}
+#endif
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -92,6 +133,15 @@ typedef struct NoxPyHostOps {
     NoxHostStatus (*task_take_result)(
         NoxHostContext *ctx, NoxHostTask task, NoxHostValue *out_val, NoxHostError **out_err);
     NoxHostStatus (*task_release)(NoxHostContext *ctx, NoxHostTask task);
+    /* ---- ABI v3 (UR-012, UR-013) buffers, typed arrays & capabilities ---- */
+    NoxHostStatus (*handle_pin_buffer)(
+        NoxHostContext *ctx, NoxHostHandle h, uint32_t req_flags, NoxHostBufferView *out_view, NoxHostError **err);
+    NoxHostStatus (*buffer_unpin)(NoxHostContext *ctx, uint64_t pin_id);
+    NoxHostStatus (*value_typed_array)(
+        NoxHostContext *ctx, int32_t dtype, const void *data, size_t count, NoxHostValue *out);
+    NoxHostStatus (*value_get_typed_array)(
+        NoxHostContext *ctx, NoxHostValue v, int32_t *out_dtype, const void **out_data, size_t *out_count);
+    uint64_t (*capabilities)(void);
 } NoxPyHostOps;
 
 typedef struct NoxPyExtRefTable NoxPyExtRefTable;
@@ -113,6 +163,9 @@ typedef struct NoxPyModuleState {
     NoxHostContext *pool[NOXPY_CTX_POOL_CAP];
     NoxPyExtRefTable *ext_refs;
     PyObject *async_op_type;
+    PyObject *buf_types[4];
+    PyObject *writable_proxy_type;
+    int64_t owner_interp_id;
 } NoxPyModuleState;
 
 /*
@@ -279,16 +332,47 @@ typedef struct NoxPyObjectData {
     uint64_t type_tag;
     uint64_t instance_gen;
     uint64_t owner_tid;
+    int64_t owner_interp_id;
     uint8_t thread_policy;
     uint8_t closed;
     uint8_t initialized;
     uint8_t lock_ready;
-    pthread_mutex_t lock;
+    noxpy_mutex_t lock;
     _Atomic uint32_t pending_async;
     _Atomic uint8_t has_deferred_close;
     NoxPySharedCtx *deferred_sc;
     NoxHostHandle deferred_handle;
+    _Atomic uint32_t active_pins;
+    int64_t cached_len;
+    uint8_t buf_kind;
 } NoxPyObjectData;
+
+/*
+ * Phase 5 (0.5) Zero-Copy PEP 3118 Pinnable Buffers (`UR-012`).
+ */
+#define NOXPY_BUF_F64 0u
+#define NOXPY_BUF_I64 1u
+#define NOXPY_BUF_I32 2u
+#define NOXPY_BUF_U8  3u
+
+int noxpy_buffers_init_module(PyObject *module, NoxPyModuleState *st);
+PyObject *noxpy_buf_get_type(PyObject *module, uint8_t buf_kind);
+PyObject *noxpy_buf_new_from_handle(
+    PyObject *module,
+    const NoxPyHostOps *ops,
+    NoxHostContext *owner_ctx,
+    NoxHostHandle handle,
+    uint8_t buf_kind);
+PyObject *noxpy_buf_new_from_shared_handle(
+    PyObject *module,
+    NoxPySharedCtx *shared_ctx,
+    NoxHostHandle handle,
+    uint8_t buf_kind);
+NoxPyObjectData *noxpy_buf_extract_data(
+    PyObject *module,
+    PyObject *obj,
+    uint8_t expected_kind,
+    const char *arg_name);
 
 uint64_t noxpy_current_tid(void);
 int noxpy_host_context_create_and_init(const NoxPyHostOps *ops, NoxHostContext **out_ctx);

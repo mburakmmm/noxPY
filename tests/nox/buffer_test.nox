@@ -1,0 +1,33 @@
+# Genuine Nox unit tests for src.buffer.spec (noxc test tests/nox).
+
+import nox.test
+from src.buffer.spec import BufferSpec, dtype_itemsize, dtype_pep3118_format, validate_contiguous_1d_spec
+from src.core.errors import NoxPyError
+
+nox.test.assert_eq_int(dtype_itemsize("float64"), 8, "float64 itemsize")
+nox.test.assert_eq_int(dtype_itemsize("int32"), 4, "int32 itemsize")
+nox.test.assert_eq_int(dtype_itemsize("uint8"), 1, "uint8 itemsize")
+nox.test.assert_eq_str(dtype_pep3118_format("float64"), "d", "float64 format")
+nox.test.assert_eq_str(dtype_pep3118_format("int64"), "q", "int64 format")
+nox.test.assert_eq_str(dtype_pep3118_format("bool"), "?", "bool format")
+
+spec: BufferSpec = validate_contiguous_1d_spec("float64", 16, True)
+nox.test.assert_eq_int(spec.itemsize, 8, "spec itemsize")
+nox.test.assert_eq_int(spec.byte_len, 128, "spec byte_len")
+nox.test.assert_true(spec.writable, "spec writable")
+
+caught_neg: bool = False
+try:
+    validate_contiguous_1d_spec("int64", -1, False)
+except NoxPyError as e:
+    caught_neg = True
+    nox.test.assert_eq_str(e.code, "NPY-E-TYPE", "neg length code")
+nox.test.assert_true(caught_neg, "neg length should raise")
+
+caught_ovf: bool = False
+try:
+    validate_contiguous_1d_spec("float64", 500000000, False)
+except NoxPyError as e:
+    caught_ovf = True
+    nox.test.assert_eq_str(e.code, "NPY-E-TYPE", "overflow length code")
+nox.test.assert_true(caught_ovf, "overflow length should raise")

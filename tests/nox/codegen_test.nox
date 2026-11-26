@@ -46,10 +46,26 @@ MANIFEST_JSON: str = """{
       "span": {"file": "src/lib.nox", "line": 11, "column": 1},
       "params": [
         {"name": "name", "type": "str"},
-        {"name": "flag", "type": "bool"},
-        {"name": "scale", "type": "float"}
+        {"name": "flag", "type": "bool", "has_default": true, "default": {"type": "bool", "value": false}},
+        {"name": "scale", "type": "float", "has_default": true, "default": {"type": "float", "value": 2.0}}
       ],
       "return_type": "None"
+    },
+    {
+      "kind": "function",
+      "id": "pkg::transform",
+      "name": "transform",
+      "c_symbol": "nox_host_export_pkg_transform",
+      "doc": "Phase 2 containers and defaults.",
+      "thread_policy": "parallel",
+      "span": {"file": "src/lib.nox", "line": 16, "column": 1},
+      "params": [
+        {"name": "xs", "type": "list[tuple[int, str]]", "marshal": "value"},
+        {"name": "opt", "type": "int | None", "marshal": "value", "has_default": true, "default": {"type": "None", "value": null}},
+        {"name": "raw", "type": "bytes", "marshal": "span", "kind": "keyword_only", "has_default": true, "default": {"type": "bytes", "hex": "00ff"}}
+      ],
+      "return_marshal": "value",
+      "return_type": "dict[str, list[str | None]]"
     }
   ]
 }"""
@@ -61,7 +77,8 @@ pyi_2: str = generate_pyi(ir)
 nox.test.assert_eq_str(pyi_1, pyi_2, "pyi determinism")
 nox.test.assert_true(nox.strings.contains(pyi_1, "def add(a: int, /, b: int) -> int:"), "pos_only signature")
 nox.test.assert_true(nox.strings.contains(pyi_1, "def echo_bytes(*, payload: bytes) -> bytes: ..."), "kw_only signature")
-nox.test.assert_true(nox.strings.contains(pyi_1, "def greet(name: str, flag: bool, scale: float) -> None: ..."), "none return")
+nox.test.assert_true(nox.strings.contains(pyi_1, "def greet(name: str, flag: bool = False, scale: float = 2.0) -> None: ..."), "default values pyi")
+nox.test.assert_true(nox.strings.contains(pyi_1, "def transform(xs: list[tuple[int, str]], opt: int | None = None"), "phase 2 pyi")
 
 nox.test.assert_eq_str(c_escape('a\\"b\n\t'), '"a\\\\\\"b\\n\\t"', "c_escape specials")
 nox.test.assert_eq_str(c_escape(nox.strings.char_from_byte(7) + nox.strings.char_from_byte(127)), '"\\x07\\x7f"', "c_escape control bytes")
@@ -78,6 +95,7 @@ nox.test.assert_true(nox.strings.contains(c_src, "nox_host_module_init__native")
 nox.test.assert_true(nox.strings.contains(c_src, "noxpy_module_ctx_acquire"), "per-thread host context pool")
 nox.test.assert_true(nox.strings.contains(c_src, "METH_FASTCALL | METH_KEYWORDS"), "keyword fastcall flags")
 nox.test.assert_true(nox.strings.contains(c_src, "noxpy_bind_fastcall_kwargs"), "keyword binder call")
+nox.test.assert_true(nox.strings.contains(c_src, "add($module, a, /, b)\\n--\\n\\n"), "PEP 457 text signature")
 nox.test.assert_true(nox.strings.contains(c_src, "Py_RETURN_NONE;"), "void return")
 
 print("codegen_test passed")

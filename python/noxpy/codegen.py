@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .ir import ExportedFunctionIR, ModuleIR
+from .ir import ExportedFunctionIR, ModuleIR, ParamIR
 
 
 def _c_escape(text: str) -> str:
@@ -29,6 +29,60 @@ def _c_escape(text: str) -> str:
     return "".join(out)
 
 
+def _py_escape_str(text: str) -> str:
+    out: list[str] = ['"']
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ch == "\0":
+            out.append("\\x00")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02x}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _py_escape_bytes_hex(hex_str: str) -> str:
+    out = ['b"']
+    for i in range(0, len(hex_str) - 1, 2):
+        out.append("\\x" + hex_str[i : i + 2])
+    out.append('"')
+    return "".join(out)
+
+
+def _format_float_lit(val: float) -> str:
+    s = str(val)
+    if "." not in s and "e" not in s and "E" not in s:
+        return s + ".0"
+    return s
+
+
+def _format_default_py(p: ParamIR) -> str:
+    if p.default_type == "None":
+        return "None"
+    if p.default_type == "bool":
+        return "True" if p.default_bool else "False"
+    if p.default_type == "int":
+        return str(p.default_int)
+    if p.default_type == "float":
+        return _format_float_lit(p.default_float)
+    if p.default_type == "str":
+        return _py_escape_str(p.default_str)
+    if p.default_type == "bytes":
+        return _py_escape_bytes_hex(p.default_str)
+    return "None"
+
+
 def _format_pyi_params(fn: ExportedFunctionIR) -> str:
     pos_only = [p for p in fn.params if p.kind == "positional_only"]
     pos_or_kw = [p for p in fn.params if p.kind == "positional_or_keyword"]
@@ -36,15 +90,24 @@ def _format_pyi_params(fn: ExportedFunctionIR) -> str:
 
     parts: list[str] = []
     for p in pos_only:
-        parts.append(f"{p.name}: {p.type_name}")
+        s = f"{p.name}: {p.type_name}"
+        if p.has_default:
+            s += f" = {_format_default_py(p)}"
+        parts.append(s)
     if pos_only:
         parts.append("/")
     for p in pos_or_kw:
-        parts.append(f"{p.name}: {p.type_name}")
+        s = f"{p.name}: {p.type_name}"
+        if p.has_default:
+            s += f" = {_format_default_py(p)}"
+        parts.append(s)
     if kw_only:
         parts.append("*")
         for p in kw_only:
-            parts.append(f"{p.name}: {p.type_name}")
+            s = f"{p.name}: {p.type_name}"
+            if p.has_default:
+                s += f" = {_format_default_py(p)}"
+            parts.append(s)
     return ", ".join(parts)
 
 
@@ -91,18 +154,91 @@ _PARAM_KIND_MACRO = {
     "keyword_only": "NOXPY_PARAM_KW_ONLY",
 }
 
+_IN_CONV_MAP = {
+    "int": "noxpy_py_to_i64_strict",
+    "float": "noxpy_py_to_f64_strict",
+    "bool": "noxpy_py_to_bool_strict",
+    "str": "noxpy_py_to_utf8_span_strict",
+    "bytes": "noxpy_py_to_bytes_span_strict",
+}
+
+
+def _c_in_var_type(p: ParamIR) -> str:
+    if p.marshal == "value":
+        return "NoxHostValue"
+    if p.marshal == "span":
+        return "NoxHostSpan"
+    return {"int": "int64_t", "float": "double", "bool": "uint8_t"}[p.type_name]
+
+
+def _c_ret_var_type(return_type: str, return_marshal: str) -> str:
+    if return_marshal == "value":
+        return "NoxHostValue"
+    if return_marshal == "span":
+        return "NoxHostBuffer"
+    return {"int": "int64_t", "float": "double", "bool": "uint8_t"}.get(return_type, "void")
+
+
+def _c_int64_literal(v: int) -> str:
+    if v < -9223372036854775807:
+        return "(-9223372036854775807LL - 1LL)"
+    return f"{v}LL"
+
+
+def _c_hex_bytes_literal(hex_str: str) -> str:
+    out = ['"']
+    for i in range(0, len(hex_str) - 1, 2):
+        out.append("\\x" + hex_str[i : i + 2])
+    out.append('"')
+    return "".join(out)
+
+
+def _c_scalar_or_span_default_init(p: ParamIR) -> str:
+    if not p.has_default:
+        return "{0}" if p.marshal == "span" else "0"
+    if p.default_type == "int":
+        return _c_int64_literal(p.default_int)
+    if p.default_type == "float":
+        return _format_float_lit(p.default_float)
+    if p.default_type == "bool":
+        return "1u" if p.default_bool else "0u"
+    if p.default_type == "str":
+        blen = len(p.default_str.encode("utf-8"))
+        return f"{{ (const uint8_t *){_c_escape(p.default_str)}, (size_t){blen}u }}"
+    if p.default_type == "bytes":
+        blen = len(p.default_str) // 2
+        return f"{{ (const uint8_t *){_c_hex_bytes_literal(p.default_str)}, (size_t){blen}u }}"
+    return "0"
+
+
+def _c_default_host_value_call(p: ParamIR, target_var: str) -> str:
+    if p.default_type == "None":
+        return f"st->host_ops->value_none(ctx, &{target_var})"
+    if p.default_type == "int":
+        return f"st->host_ops->value_int(ctx, {_c_int64_literal(p.default_int)}, &{target_var})"
+    if p.default_type == "float":
+        return f"st->host_ops->value_float(ctx, {_format_float_lit(p.default_float)}, &{target_var})"
+    if p.default_type == "bool":
+        bval = "1u" if p.default_bool else "0u"
+        return f"st->host_ops->value_bool(ctx, {bval}, &{target_var})"
+    if p.default_type == "str":
+        blen = len(p.default_str.encode("utf-8"))
+        return f"st->host_ops->value_str(ctx, (const uint8_t *){_c_escape(p.default_str)}, (size_t){blen}u, 0, &{target_var})"
+    blen = len(p.default_str) // 2
+    return f"st->host_ops->value_str(ctx, (const uint8_t *){_c_hex_bytes_literal(p.default_str)}, (size_t){blen}u, 1, &{target_var})"
+
 
 def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines: list[str] = []
     c_params = ["NoxHostContext *ctx"]
     for i, p in enumerate(fn.params):
-        if p.type_name in ("str", "bytes"):
+        if p.marshal == "span":
             c_params.append(f"const uint8_t *arg_{i}_data")
             c_params.append(f"size_t arg_{i}_len")
         else:
-            c_params.append(f"{_C_IN_VAR_MAP[p.type_name]} arg_{i}")
+            c_params.append(f"{_c_in_var_type(p)} arg_{i}")
     if fn.return_type != "None":
-        c_params.append(f"{_C_RET_VAR_MAP[fn.return_type]} *out_val")
+        c_params.append(f"{_c_ret_var_type(fn.return_type, fn.return_marshal)} *out_val")
     c_params.append("NoxHostError **out_err")
 
     lines.append(f"extern NoxHostStatus {fn.c_symbol}({', '.join(c_params)});")
@@ -122,7 +258,8 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     else:
         lines.append("    static const NoxPyParamSpec params[] = {")
         for p in fn.params:
-            lines.append(f"        {{ {_c_escape(p.name)}, {_PARAM_KIND_MACRO[p.kind]} }},")
+            hd_u = "1u" if p.has_default else "0u"
+            lines.append(f"        {{ {_c_escape(p.name)}, {_PARAM_KIND_MACRO[p.kind]}, {hd_u} }},")
         lines.append("    };")
         lines.append(f"    PyObject *bound[{argc}] = {{ NULL }};")
         lines.append(
@@ -131,18 +268,19 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
         lines.append("        return NULL;")
         lines.append("    }")
 
+    value_indices: list[int] = []
     for i, p in enumerate(fn.params):
-        ctype = _C_IN_VAR_MAP[p.type_name]
-        init = "{0}" if ctype == "NoxHostSpan" else "0"
-        lines.append(f"    {ctype} c_arg_{i} = {init};")
-        conv = {
-            "int": "noxpy_py_to_i64_strict",
-            "float": "noxpy_py_to_f64_strict",
-            "bool": "noxpy_py_to_bool_strict",
-            "str": "noxpy_py_to_utf8_span_strict",
-            "bytes": "noxpy_py_to_bytes_span_strict",
-        }[p.type_name]
-        lines.append(f"    if ({conv}(bound[{i}], &c_arg_{i}, {_c_escape(p.name)}) < 0) {{")
+        if p.marshal == "value":
+            value_indices.append(i)
+            continue
+        ctype = _c_in_var_type(p)
+        init_val = _c_scalar_or_span_default_init(p)
+        lines.append(f"    {ctype} c_arg_{i} = {init_val};")
+        conv = _IN_CONV_MAP[p.type_name]
+        if p.has_default:
+            lines.append(f"    if (bound[{i}] != NULL && {conv}(bound[{i}], &c_arg_{i}, {_c_escape(p.name)}) < 0) {{")
+        else:
+            lines.append(f"    if ({conv}(bound[{i}], &c_arg_{i}, {_c_escape(p.name)}) < 0) {{")
         lines.append("        return NULL;")
         lines.append("    }")
 
@@ -156,14 +294,52 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines.append("        return NULL;")
     lines.append("    }")
 
+    for vi in value_indices:
+        lines.append(f"    NoxHostValue c_arg_{vi} = 0;")
+
+    for vpos, vi in enumerate(value_indices):
+        pv = fn.params[vi]
+        if pv.has_default:
+            lines.append(f"    if (bound[{vi}] != NULL) {{")
+            lines.append(
+                f"        if (noxpy_py_to_host_value(st->host_ops, ctx, bound[{vi}], {_c_escape(pv.type_name)}, &c_arg_{vi}, {_c_escape(pv.name)}) < 0) {{"
+            )
+            for k in range(vpos):
+                lines.append(f"            if (c_arg_{value_indices[k]}) {{ (void)st->host_ops->value_release(ctx, c_arg_{value_indices[k]}); }}")
+            lines.append("            noxpy_module_ctx_release(st, ctx);")
+            lines.append("            noxpy_module_lease_release(st);")
+            lines.append("            return NULL;")
+            lines.append("        }")
+            lines.append("    } else {")
+            lines.append(f"        NoxHostStatus def_rc_{vi} = {_c_default_host_value_call(pv, f'c_arg_{vi}')};")
+            lines.append(f"        if (def_rc_{vi} != NOX_HOST_OK) {{")
+            lines.append(f"            noxpy_set_exception_from_host(st->host_ops, def_rc_{vi}, NULL);")
+            for k in range(vpos):
+                lines.append(f"            if (c_arg_{value_indices[k]}) {{ (void)st->host_ops->value_release(ctx, c_arg_{value_indices[k]}); }}")
+            lines.append("            noxpy_module_ctx_release(st, ctx);")
+            lines.append("            noxpy_module_lease_release(st);")
+            lines.append("            return NULL;")
+            lines.append("        }")
+            lines.append("    }")
+        else:
+            lines.append(
+                f"    if (noxpy_py_to_host_value(st->host_ops, ctx, bound[{vi}], {_c_escape(pv.type_name)}, &c_arg_{vi}, {_c_escape(pv.name)}) < 0) {{"
+            )
+            for k in range(vpos):
+                lines.append(f"        if (c_arg_{value_indices[k]}) {{ (void)st->host_ops->value_release(ctx, c_arg_{value_indices[k]}); }}")
+            lines.append("        noxpy_module_ctx_release(st, ctx);")
+            lines.append("        noxpy_module_lease_release(st);")
+            lines.append("        return NULL;")
+            lines.append("    }")
+
     if fn.return_type != "None":
-        ret_ctype = _C_RET_VAR_MAP[fn.return_type]
+        ret_ctype = _c_ret_var_type(fn.return_type, fn.return_marshal)
         ret_init = "{0}" if ret_ctype == "NoxHostBuffer" else "0"
         lines.append(f"    {ret_ctype} c_ret = {ret_init};")
 
     call_args = ["ctx"]
     for i, p in enumerate(fn.params):
-        if p.type_name in ("str", "bytes"):
+        if p.marshal == "span":
             call_args.append(f"c_arg_{i}.data")
             call_args.append(f"c_arg_{i}.len")
         else:
@@ -177,30 +353,60 @@ def _emit_c_function_adapter(fn: ExportedFunctionIR) -> list[str]:
     lines.append("    Py_BEGIN_ALLOW_THREADS")
     lines.append(f"    rc = {fn.c_symbol}({', '.join(call_args)});")
     lines.append("    Py_END_ALLOW_THREADS")
+    for vi in value_indices:
+        lines.append(f"    if (c_arg_{vi}) {{ (void)st->host_ops->value_release(ctx, c_arg_{vi}); }}")
     lines.append("    if (rc != NOX_HOST_OK) {")
     lines.append("        noxpy_set_exception_from_host(st->host_ops, rc, err);")
     lines.append("        noxpy_module_ctx_release(st, ctx);")
     lines.append("        noxpy_module_lease_release(st);")
     lines.append("        return NULL;")
     lines.append("    }")
-    lines.append("    noxpy_module_ctx_release(st, ctx);")
-    lines.append("    noxpy_module_lease_release(st);")
 
-    if fn.return_type == "None":
-        lines.append("    Py_RETURN_NONE;")
-    elif fn.return_type == "int":
-        lines.append("    return noxpy_i64_to_py(c_ret);")
-    elif fn.return_type == "float":
-        lines.append("    return noxpy_f64_to_py(c_ret);")
-    elif fn.return_type == "bool":
-        lines.append("    return noxpy_bool_to_py(c_ret);")
-    elif fn.return_type == "str":
-        lines.append("    return noxpy_utf8_buffer_to_py(st->host_ops, &c_ret);")
+    if fn.return_marshal == "value":
+        lines.append("    PyObject *py_ret = noxpy_host_value_to_py(st->host_ops, ctx, c_ret);")
+        lines.append("    if (c_ret) { (void)st->host_ops->value_release(ctx, c_ret); }")
+        lines.append("    noxpy_module_ctx_release(st, ctx);")
+        lines.append("    noxpy_module_lease_release(st);")
+        lines.append("    return py_ret;")
     else:
-        lines.append("    return noxpy_bytes_buffer_to_py(st->host_ops, &c_ret);")
+        lines.append("    noxpy_module_ctx_release(st, ctx);")
+        lines.append("    noxpy_module_lease_release(st);")
+        if fn.return_type == "None":
+            lines.append("    Py_RETURN_NONE;")
+        elif fn.return_type == "int":
+            lines.append("    return noxpy_i64_to_py(c_ret);")
+        elif fn.return_type == "float":
+            lines.append("    return noxpy_f64_to_py(c_ret);")
+        elif fn.return_type == "bool":
+            lines.append("    return noxpy_bool_to_py(c_ret);")
+        elif fn.return_type == "str":
+            lines.append("    return noxpy_utf8_buffer_to_py(st->host_ops, &c_ret);")
+        else:
+            lines.append("    return noxpy_bytes_buffer_to_py(st->host_ops, &c_ret);")
     lines.append("}")
     lines.append("")
     return lines
+
+
+def _format_ml_doc(fn: ExportedFunctionIR) -> str:
+    pos_only = [p for p in fn.params if p.kind == "positional_only"]
+    pos_or_kw = [p for p in fn.params if p.kind == "positional_or_keyword"]
+    kw_only = [p for p in fn.params if p.kind == "keyword_only"]
+
+    sig_parts: list[str] = [f"{p.name}={_format_default_py(p)}" if p.has_default else p.name for p in pos_only]
+    if pos_only:
+        sig_parts.append("/")
+    sig_parts.extend(f"{p.name}={_format_default_py(p)}" if p.has_default else p.name for p in pos_or_kw)
+    if kw_only:
+        sig_parts.append("*")
+        sig_parts.extend(f"{p.name}={_format_default_py(p)}" if p.has_default else p.name for p in kw_only)
+
+    sig_header = f"{fn.name}($module"
+    if sig_parts:
+        sig_header += ", " + ", ".join(sig_parts)
+    sig_header += ")"
+    body = fn.doc if fn.doc else ""
+    return f"{sig_header}\n--\n\n{body}"
 
 
 def generate_c_adapter(ir: ModuleIR) -> str:
@@ -225,6 +431,22 @@ def generate_c_adapter(ir: ModuleIR) -> str:
         "    .error_line = nox_host_error_line,",
         "    .error_class_name = nox_host_error_class_name,",
         "    .error_message = nox_host_error_message,",
+        "    .value_none = nox_host_value_none,",
+        "    .value_int = nox_host_value_int,",
+        "    .value_float = nox_host_value_float,",
+        "    .value_bool = nox_host_value_bool,",
+        "    .value_str = nox_host_value_str,",
+        "    .value_container = nox_host_value_container,",
+        "    .value_append = nox_host_value_append,",
+        "    .value_dict_set = nox_host_value_dict_set,",
+        "    .value_kind = nox_host_value_kind,",
+        "    .value_get_int = nox_host_value_get_int,",
+        "    .value_get_float = nox_host_value_get_float,",
+        "    .value_get_span = nox_host_value_get_span,",
+        "    .value_len = nox_host_value_len,",
+        "    .value_item = nox_host_value_item,",
+        "    .value_dict_entry = nox_host_value_dict_entry,",
+        "    .value_release = nox_host_value_release,",
         "};",
         "",
     ]
@@ -234,7 +456,7 @@ def generate_c_adapter(ir: ModuleIR) -> str:
 
     lines.append(f"static PyMethodDef noxpy_methods_{leaf}[] = {{")
     for fn in ir.functions:
-        doc_c = _c_escape(fn.doc) if fn.doc else "NULL"
+        doc_c = _c_escape(_format_ml_doc(fn))
         lines.append(
             f"    {{ {_c_escape(fn.name)}, _PyCFunction_CAST(noxpy_wrap_{fn.name}), METH_FASTCALL | METH_KEYWORDS, {doc_c} }},"
         )

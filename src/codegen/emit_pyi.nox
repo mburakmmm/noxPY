@@ -3,7 +3,79 @@
 import nox.strings
 from src.codegen.ir import ExportedFunctionIR, ModuleIR, ParamIR
 
-__all__: list[str] = ["format_pyi_params", "generate_pyi"]
+__all__: list[str] = ["format_default_py", "format_pyi_params", "generate_pyi"]
+
+_HEX_DIGITS: str = "0123456789abcdef"
+
+
+def _hex2(b: int) -> str:
+    hi: int = (b >> 4) & 15
+    lo: int = b & 15
+    return nox.strings.char_from_byte(nox.strings.byte_at(_HEX_DIGITS, hi)) + nox.strings.char_from_byte(
+        nox.strings.byte_at(_HEX_DIGITS, lo)
+    )
+
+
+def _py_escape_str(text: str) -> str:
+    out: list[str] = ['"']
+    n: int = nox.strings.byte_len(text)
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(text, i)
+        if b == 92:
+            out.append("\\\\")
+        elif b == 34:
+            out.append('\\"')
+        elif b == 10:
+            out.append("\\n")
+        elif b == 13:
+            out.append("\\r")
+        elif b == 9:
+            out.append("\\t")
+        elif b == 0:
+            out.append("\\x00")
+        elif b < 32 or b == 127:
+            out.append("\\x" + _hex2(b))
+        else:
+            out.append(nox.strings.char_from_byte(b))
+        i += 1
+    out.append('"')
+    return nox.strings.join(out, "")
+
+
+def _py_escape_bytes_hex(hex_str: str) -> str:
+    n: int = nox.strings.byte_len(hex_str)
+    out: list[str] = ['b"']
+    i: int = 0
+    while i + 1 < n:
+        out.append("\\x" + nox.strings.char_from_byte(nox.strings.byte_at(hex_str, i)) + nox.strings.char_from_byte(nox.strings.byte_at(hex_str, i + 1)))
+        i += 2
+    out.append('"')
+    return nox.strings.join(out, "")
+
+
+def _format_float_lit(val: float) -> str:
+    s: str = str(val)
+    if not nox.strings.contains(s, ".") and not nox.strings.contains(s, "e") and not nox.strings.contains(s, "E"):
+        return s + ".0"
+    return s
+
+
+def format_default_py(p: ParamIR) -> str:
+    """Format constant parameter default as a deterministic Python literal."""
+    if p.default_type == "None":
+        return "None"
+    if p.default_type == "bool":
+        return "True" if p.default_bool else "False"
+    if p.default_type == "int":
+        return str(p.default_int)
+    if p.default_type == "float":
+        return _format_float_lit(p.default_float)
+    if p.default_type == "str":
+        return _py_escape_str(p.default_str)
+    if p.default_type == "bytes":
+        return _py_escape_bytes_hex(p.default_str)
+    return "None"
 
 
 def format_pyi_params(fn: ExportedFunctionIR) -> str:
@@ -22,15 +94,24 @@ def format_pyi_params(fn: ExportedFunctionIR) -> str:
 
     parts: list[str] = []
     for p in pos_only:
-        parts.append(p.name + ": " + p.type_name)
+        s: str = p.name + ": " + p.type_name
+        if p.has_default:
+            s = s + " = " + format_default_py(p)
+        parts.append(s)
     if len(pos_only) > 0:
         parts.append("/")
     for p in pos_or_kw:
-        parts.append(p.name + ": " + p.type_name)
+        s2: str = p.name + ": " + p.type_name
+        if p.has_default:
+            s2 = s2 + " = " + format_default_py(p)
+        parts.append(s2)
     if len(kw_only) > 0:
         parts.append("*")
         for p in kw_only:
-            parts.append(p.name + ": " + p.type_name)
+            s3: str = p.name + ": " + p.type_name
+            if p.has_default:
+                s3 = s3 + " = " + format_default_py(p)
+            parts.append(s3)
     return nox.strings.join(parts, ", ")
 
 

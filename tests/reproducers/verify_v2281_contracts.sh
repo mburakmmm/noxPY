@@ -54,4 +54,9 @@ echo "[UR-004] PASS: independent per-thread NoxHostContext contract verified (fu
 (cd "$ROOT" && "$NOXC" run src/cli/main.nox -- check-ir "$TMPDIR_WORK/manifest.json" --json) >/dev/null
 echo "[UR-007] PASS: noxc expand --json validated by NoxPy src/cli/main.nox check-ir"
 
-echo "=== All 7 upstream contracts (UR-001..UR-007) VERIFIED ==="
+if grep -q "NOX_HOST_ABI_VERSION 2u" "$HOST_H"; then
+    bash "$SCRIPT_DIR/ur008_host_abi_containers.sh"
+    echo "=== All 8 upstream contracts (UR-001..UR-008) VERIFIED ==="
+else
+    echo "=== All 7 upstream contracts (UR-001..UR-007) VERIFIED ==="
+fi

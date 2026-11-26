@@ -1,0 +1,105 @@
+@export
+def add(a: int, b: int) -> int:
+    """Add two integers natively."""
+    return a + b
+
+
+@export
+def greet(name: str) -> str:
+    """Greet name natively with binary-safe UTF-8."""
+    return "Hello from Nox, " + name + "!"
+
+
+@export
+def checked_div(a: int, b: int) -> int:
+    """Floor divide a by b, raising ValueError on zero."""
+    if b == 0:
+        raise ValueError("division by zero")
+    return a // b
+
+
+@export
+def opt_int(x: int | None = None) -> int | None:
+    """Echo optional int value."""
+    return x
+
+
+@export
+def opt_str(x: str | None = "world") -> str:
+    """Format optional str with default."""
+    if x is None:
+        return "none"
+    return "got " + x
+
+
+@export
+def sum_list(xs: list[int]) -> int:
+    """Sum integer list natively."""
+    total: int = 0
+    for x in xs:
+        total = total + x
+    return total
+
+
+@export
+def scale_list(xs: list[float], factor: float = 2.0) -> list[float]:
+    """Scale float list by constant factor."""
+    out: list[float] = []
+    for x in xs:
+        out.append(x * factor)
+    return out
+
+
+@export
+def double_map(d: dict[str, int]) -> dict[str, int]:
+    """Double integer values in dict preserving insertion order."""
+    out: dict[str, int] = {}
+    for k in d.keys():
+        out[k] = d[k] * 2
+    return out
+
+
+@export
+def swap_pair(p: tuple[int, str]) -> tuple[str, int]:
+    """Swap (int, str) tuple elements."""
+    return (p[1], p[0])
+
+
+@export
+def nested_groups(xs: list[tuple[int, str]]) -> dict[str, list[str | None]]:
+    """Build nested dict[str, list[str | None]] from list[tuple[int, str]]."""
+    out: dict[str, list[str | None]] = {}
+    for p in xs:
+        row: list[str | None] = []
+        row.append(p[1])
+        row.append(None)
+        out[p[1]] = row
+    return out
+
+
+@export
+def echo_blobs(items: list[bytes], flags: list[bool]) -> list[bytes]:
+    """Echo binary-safe bytes list with optional marker byte."""
+    out: list[bytes] = []
+    for x in items:
+        out.append(x)
+    if len(flags) > 0 and flags[0]:
+        out.append(b"\x00z")
+    return out
+
+
+@export
+def boom_list(xs: list[int]) -> list[int]:
+    """Raise ValueError after receiving container input."""
+    raise ValueError("boom_list")
+
+
+@export
+def tag_bytes(payload: bytes, *, repeat: int = 1) -> bytes:
+    """Repeat binary payload with keyword-only int default."""
+    out: bytes = b""
+    i: int = 0
+    while i < repeat:
+        out = out + payload
+        i += 1
+    return out

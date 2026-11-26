@@ -6,7 +6,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
-- Phase 2 (`0.2` Types, Stubs & Packaging) work queued next.
+### Added (Phase 2 — Types, Containers, Defaults, & Packaging Complete on `noxc v2.2.87`)
+- Integrated upstream [`native/include/nox_host.h`](native/include/nox_host.h) ABI v2 (`NOX_HOST_ABI_VERSION = 2u`, `NoxHostValue`), backward-compatible with v1 (`experiments/phase0_poc`), resolving [`UR-008`](UPSTREAM_REQUIREMENTS.md) ([`tests/reproducers/ur008_host_abi_containers.sh`](tests/reproducers/ur008_host_abi_containers.sh)).
+- Recursive CPython 3.15 `abi3t` `NoxHostValue` converters (`noxpy_py_to_host_value`, `noxpy_host_value_to_py`), `NoxPyParamSpec.has_default`, atomic snapshots (`PySequence_Tuple`, `PyDict_Items`), cycle detection, and nesting depth caps (`NOXPY_MAX_CONV_DEPTH = 32`) in [`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c) + `_native/` sync, audited cleanly via [`python/noxpy/audit.py`](python/noxpy/audit.py).
+- Recursive container/Optional/tuple type validation (`T | None`, `list[T]`, `dict[K, V]`, `tuple[...]`), `marshal`/`return_marshal` verification, and typed constant default values (`int`, `float`, `bool`, `str`, `bytes`, `None`) aligned across [`src/codegen/ir.nox`](src/codegen/ir.nox) and [`python/noxpy/ir.py`](python/noxpy/ir.py).
+- Byte-for-byte aligned `.pyi` default formatting and CPython 3.15 `abi3t` value-tree / default C wrappers + PEP 457 `__text_signature__` across [`src/codegen/emit_pyi.nox`](src/codegen/emit_pyi.nox), [`src/codegen/emit_c.nox`](src/codegen/emit_c.nox), and [`python/noxpy/codegen.py`](python/noxpy/codegen.py).
+- `nox.lock` validation ([`src/builder/lockfile.nox`](src/builder/lockfile.nox), [`python/noxpy/lockfile.py`](python/noxpy/lockfile.py)), deterministic `.noxpy-cache` (including `ir.py` & native headers in key), reproducible PEP 517 `build_sdist` (`gzip filename=""` + `SOURCE_DATE_EPOCH`), PEP 660 `build_editable`, `noxpy init`, `noxpy clean`, and `noxpy generate-stubs --check`.
+- Extended [`examples/mixed_package/`](examples/mixed_package/) and [`tests/packaging/test_phase2_packaging.py`](tests/packaging/test_phase2_packaging.py) (end-to-end `sdist -> wheel` + editable + 8-thread `3.15t` container & concurrent list-mutation stress tests), seeded property/fuzz tests ([`tests/fuzz/`](tests/fuzz/)), [`docs/evidence/phase2-2026-11-25.md`](docs/evidence/phase2-2026-11-25.md), and [`docs/evidence/phase2-2026-11-26.md`](docs/evidence/phase2-2026-11-26.md).
+- Security/portability fix in [`python/noxpy/config.py`](python/noxpy/config.py): `_resolve_safe_relpath` now rejects leading backslashes and Windows drive prefixes on POSIX hosts (matching `src/builder/config.nox`).
 
 ## [0.1.0a1] — 2026-11-25 (Phase 1 Alpha: Functions & Wheels + Phase 0 Exit)
 

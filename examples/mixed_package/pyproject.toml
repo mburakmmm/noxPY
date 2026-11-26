@@ -1,0 +1,18 @@
+[build-system]
+requires = ["noxpy>=0.1.0a1"]
+build-backend = "noxpy.build"
+
+[project]
+name = "noxpy-mixed"
+version = "0.2.0a1"
+description = "Mixed Python + Nox native package example with PEP 561 stubs and PEP 660 editable support."
+requires-python = ">=3.15"
+
+[tool.noxpy]
+module-name = "mixed_pkg._native"
+source = "src/native.nox"
+python-source = "python"
+backend = "llvm"
+abi = "abi3t"
+free-threaded = true
+generate-stubs = true

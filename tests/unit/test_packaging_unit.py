@@ -16,12 +16,16 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
 
 from noxpy.build import (  # noqa: E402
+    build_project_sdist,
+    clean_project,
     compute_platform_tag,
     develop_install,
+    init_project,
     normalize_dist_name,
     prepare_metadata_for_build_wheel,
     write_deterministic_wheel,
 )
+from noxpy.lockfile import compute_lock_digest, parse_nox_lock_json  # noqa: E402
 from noxpy.config import load_pyproject  # noqa: E402
 from noxpy.errors import NoxPyError  # noqa: E402
 
@@ -120,6 +124,48 @@ class TestPackagingUnit(unittest.TestCase):
         for src, bundled in pairs:
             self.assertTrue(bundled.is_file(), f"Missing bundled native asset: {bundled}")
             self.assertEqual(src.read_bytes(), bundled.read_bytes(), f"Bundled {bundled.name} drifted from {src}")
+
+    def test_lockfile_init_clean_and_deterministic_sdist(self) -> None:
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as td:
+            proj = Path(td) / "demo_proj"
+            proj.mkdir()
+            created = init_project(proj)
+            self.assertIn("pyproject.toml", created)
+            self.assertIn("src/lib.nox", created)
+
+            (proj / "nox.lock").write_text(
+                '{"packages": [{"alias": "nyx", "repo": "github.com/mburakmmm/nyx", "ref": "v0.21.0", "resolved": "1e7388a908aa2ca0fcfc2810f78ad88fbff82d77"}]}',
+                encoding="utf-8",
+            )
+            pkgs = parse_nox_lock_json({"packages": [{"alias": "nyx", "repo": "github.com/mburakmmm/nyx", "ref": "v0.21.0", "resolved": "1e7388a908aa2ca0fcfc2810f78ad88fbff82d77"}]})
+            self.assertEqual(len(pkgs), 1)
+            d1 = compute_lock_digest(proj)
+            self.assertEqual(len(d1), 64)
+
+            cache_dir = proj / ".noxpy-cache"
+            cache_dir.mkdir()
+            (cache_dir / "junk").write_text("x", encoding="utf-8")
+
+            sdist_dir1 = Path(td) / "s1"
+            sdist_dir2 = Path(td) / "s2"
+            os.environ["SOURCE_DATE_EPOCH"] = "1790000000"
+            try:
+                t1 = build_project_sdist(proj, sdist_dir1)
+                t2 = build_project_sdist(proj, sdist_dir2)
+            finally:
+                os.environ.pop("SOURCE_DATE_EPOCH", None)
+
+            self.assertEqual(hashlib.sha256(t1.read_bytes()).hexdigest(), hashlib.sha256(t2.read_bytes()).hexdigest())
+            with tarfile.open(t1, "r:gz") as tf:
+                names = tf.getnames()
+                self.assertTrue(any(n.endswith("/PKG-INFO") for n in names))
+                self.assertTrue(any(n.endswith("/nox.lock") for n in names))
+                self.assertFalse(any(".noxpy-cache" in n for n in names))
+
+            removed = clean_project(proj)
+            self.assertEqual(removed, [".noxpy-cache"])
 
 
 if __name__ == "__main__":

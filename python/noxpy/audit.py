@@ -18,8 +18,13 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyBool_Type",
         "PyBytes_AsStringAndSize",
         "PyBytes_FromStringAndSize",
+        "PyDict_Items",
+        "PyDict_New",
+        "PyDict_SetItem",
+        "PyDict_Type",
         "PyErr_ExceptionMatches",
         "PyErr_Format",
+        "PyErr_NoMemory",
         "PyErr_Occurred",
         "PyErr_SetString",
         "PyEval_RestoreThread",
@@ -29,6 +34,7 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyExc_MemoryError",
         "PyExc_NotImplementedError",
         "PyExc_OverflowError",
+        "PyExc_RecursionError",
         "PyExc_RuntimeError",
         "PyExc_SystemError",
         "PyExc_TypeError",
@@ -37,13 +43,22 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyFloat_AsDouble",
         "PyFloat_FromDouble",
         "PyFloat_Type",
+        "PyList_New",
+        "PyList_SetItem",
+        "PyList_Size",
+        "PyList_Type",
         "PyLong_AsInt64",
         "PyLong_FromInt64",
         "PyLong_Type",
         "PyModule_GetState",
         "PyObject_TypeCheck",
+        "PySequence_GetItem",
+        "PySequence_Tuple",
         "PyTuple_GetItem",
+        "PyTuple_New",
+        "PyTuple_SetItem",
         "PyTuple_Size",
+        "PyTuple_Type",
         "PyType_FastSubclass",
         "PyType_GetFlags",
         "PyType_IsSubtype",
@@ -51,12 +66,19 @@ ALLOWED_C_PY_IMPORTS = frozenset(
         "PyUnicode_CompareWithASCIIString",
         "PyUnicode_DecodeUTF8",
         "PyUnicode_Type",
+        "Py_DecRef",
         "Py_GetConstantBorrowed",
         "Py_IS_TYPE",
+        "Py_IncRef",
         "Py_NoneStruct",
         "Py_TYPE",
     }
 )
+
+
+# CPython 3.15 limited API / abi3t inline `Py_DECREF` / `Py_INCREF` expand to these
+# documented runtime thunks (`include/cpython/...` / `refcount.h:329-335`).
+LIMITED_ABI_REFCOUNT_THUNKS = frozenset({"_Py_DecRef", "_Py_IncRef"})
 
 
 @dataclass(frozen=True)
@@ -169,6 +191,8 @@ def audit_extension_binary(so_path: str | Path, expected_export_symbol: str) -> 
 
     disallowed = []
     for c_sym in py_c_syms:
+        if c_sym in LIMITED_ABI_REFCOUNT_THUNKS:
+            continue
         if c_sym.startswith("_Py"):
             disallowed.append(f"{c_sym} (private CPython internal symbol)")
         elif c_sym not in ALLOWED_C_PY_IMPORTS:

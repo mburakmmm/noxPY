@@ -71,12 +71,51 @@ static PyObject *test_bytes(PyObject *self, PyObject *arg) {
     return noxpy_bytes_span_to_py(sp);
 }
 
+static PyObject *test_opt_i64(PyObject *self, PyObject *arg) {
+    (void)self;
+    int has_val = 0;
+    int64_t val = 0;
+    if (noxpy_py_to_opt_i64_strict(arg, &has_val, &val, "opt") < 0) return NULL;
+    return noxpy_opt_i64_to_py(has_val, val);
+}
+
+static PyObject *test_list_i64(PyObject *self, PyObject *arg) {
+    (void)self;
+    NoxPyConvGuard g;
+    noxpy_conv_guard_init(&g, NOXPY_MAX_CONV_DEPTH, 10000);
+    int64_t *buf = NULL;
+    size_t len = 0;
+    if (noxpy_py_list_i64_snapshot_strict(arg, &g, &buf, &len, "xs") < 0) return NULL;
+    PyObject *out = noxpy_i64_array_to_py_list(buf, len);
+    noxpy_free_buffer(buf);
+    return out;
+}
+
+static PyObject *test_dict_str_i64(PyObject *self, PyObject *arg) {
+    (void)self;
+    NoxPyConvGuard g;
+    noxpy_conv_guard_init(&g, NOXPY_MAX_CONV_DEPTH, 10000);
+    return noxpy_py_dict_str_i64_roundtrip_strict(arg, &g, "d");
+}
+
+static PyObject *test_validate_tree(PyObject *self, PyObject *arg) {
+    (void)self;
+    NoxPyConvGuard g;
+    noxpy_conv_guard_init(&g, NOXPY_MAX_CONV_DEPTH, 5000);
+    if (noxpy_py_validate_acyclic_tree(arg, &g, "tree") < 0) return NULL;
+    return noxpy_i64_to_py((int64_t)g.items);
+}
+
 static PyMethodDef shim_test_methods[] = {
     {"rt_i64", test_i64, METH_O, NULL},
     {"rt_bool", test_bool, METH_O, NULL},
     {"rt_f64", test_f64, METH_O, NULL},
     {"rt_str", test_str, METH_O, NULL},
     {"rt_bytes", test_bytes, METH_O, NULL},
+    {"rt_opt_i64", test_opt_i64, METH_O, NULL},
+    {"rt_list_i64", test_list_i64, METH_O, NULL},
+    {"rt_dict_str_i64", test_dict_str_i64, METH_O, NULL},
+    {"validate_tree", test_validate_tree, METH_O, NULL},
     {NULL, NULL, 0, NULL}
 };
 

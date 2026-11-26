@@ -123,15 +123,31 @@ _expect_err(
 )
 
 _expect_err(
-    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
-    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [{"name": "xs", "type": "list[int]"}], "return_type": "None"}]}',
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [{"name": "xs", "type": "set[int]"}], "return_type": "None"}]}',
     "",
     "NPY-E-TYPE",
     "unsupported param type",
 )
 
 _expect_err(
-    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [{"name": "xs", "type": "list[int | None]"}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "unsupported optional int in container",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": [{"name": "p", "type": "tuple__int_str"}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "legacy mangled tuple name rejected",
+)
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
     '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "thread_policy": "unsafe", "span": {"file": "m.nox", "line": 1}, "params": [], "return_type": "None"}]}',
     "",
     "NPY-E-TYPE",
@@ -139,7 +155,7 @@ _expect_err(
 )
 
 _expect_err(
-    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
     '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": ['
     '{"name": "k", "type": "int", "kind": "keyword_only"}, {"name": "p", "type": "int", "kind": "positional_only"}], "return_type": "None"}]}',
     "",
@@ -148,12 +164,38 @@ _expect_err(
 )
 
 _expect_err(
-    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.70"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
     '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": ['
-    '{"name": "p", "type": "int", "has_default": true}], "return_type": "None"}]}',
+    '{"name": "p", "type": "int", "has_default": true, "default": null}], "return_type": "None"}]}',
     "",
     "NPY-E-TYPE",
-    "unsupported default value",
+    "missing default metadata",
 )
+
+_expect_err(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "m", "source": "m.nox"}, "exports": ['
+    '{"kind": "function", "id": "id1", "name": "f", "c_symbol": "s1", "span": {"file": "m.nox", "line": 1}, "params": ['
+    '{"name": "a", "type": "int", "has_default": true, "default": {"type": "int", "value": 1}}, '
+    '{"name": "b", "type": "int", "has_default": false}], "return_type": "None"}]}',
+    "",
+    "NPY-E-TYPE",
+    "non-default after default",
+)
+
+p2_ir: ModuleIR = parse_upstream_metadata_json(
+    '{"schema_version": 1, "compiler": {"name": "noxc", "version": "2.2.87"}, "module": {"name": "pkg._p2", "source": "p2.nox"}, "exports": ['
+    '{"kind": "function", "id": "pkg::fn", "name": "fn", "c_symbol": "nox_host_export_pkg_fn", "span": {"file": "p2.nox", "line": 1}, '
+    '"params": ['
+    '{"name": "xs", "type": "list[tuple[int, str]]", "marshal": "value"}, '
+    '{"name": "opt", "type": "int | None", "marshal": "value", "has_default": true, "default": {"type": "None", "value": null}}, '
+    '{"name": "scale", "type": "float", "marshal": "scalar", "kind": "keyword_only", "has_default": true, "default": {"type": "float", "value": 2.5}}'
+    '], "return_marshal": "value", "return_type": "dict[str, list[str | None]]"}]}',
+    "pkg._p2",
+    "abi3t",
+    True,
+)
+nox.test.assert_eq_str(p2_ir.functions[0].return_marshal, "value", "phase 2 return_marshal")
+nox.test.assert_true(p2_ir.functions[0].params[1].has_default, "phase 2 default parsed")
+nox.test.assert_eq_str(p2_ir.functions[0].params[1].default_type, "None", "phase 2 None default")
 
 print("ir_test passed")

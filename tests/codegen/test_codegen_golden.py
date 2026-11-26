@@ -55,10 +55,26 @@ MANIFEST = {
             "span": {"file": "src/lib.nox", "line": 11, "column": 1},
             "params": [
                 {"name": "name", "type": "str"},
-                {"name": "flag", "type": "bool"},
-                {"name": "scale", "type": "float"},
+                {"name": "flag", "type": "bool", "has_default": True, "default": {"type": "bool", "value": False}},
+                {"name": "scale", "type": "float", "has_default": True, "default": {"type": "float", "value": 2.0}},
             ],
             "return_type": "None",
+        },
+        {
+            "kind": "function",
+            "id": "pkg::transform",
+            "name": "transform",
+            "c_symbol": "nox_host_export_pkg_transform",
+            "doc": "Phase 2 containers and defaults.",
+            "thread_policy": "parallel",
+            "span": {"file": "src/lib.nox", "line": 16, "column": 1},
+            "params": [
+                {"name": "xs", "type": "list[tuple[int, str]]", "marshal": "value"},
+                {"name": "opt", "type": "int | None", "marshal": "value", "has_default": True, "default": {"type": "None", "value": None}},
+                {"name": "raw", "type": "bytes", "marshal": "span", "kind": "keyword_only", "has_default": True, "default": {"type": "bytes", "hex": "00ff"}},
+            ],
+            "return_marshal": "value",
+            "return_type": "dict[str, list[str | None]]",
         },
     ],
 }
@@ -72,7 +88,11 @@ class TestCodegenGolden(unittest.TestCase):
         self.assertEqual(pyi_1, pyi_2)
         self.assertIn("def add(a: int, /, b: int) -> int:", pyi_1)
         self.assertIn("def echo_bytes(*, payload: bytes) -> bytes: ...", pyi_1)
-        self.assertIn("def greet(name: str, flag: bool, scale: float) -> None: ...", pyi_1)
+        self.assertIn("def greet(name: str, flag: bool = False, scale: float = 2.0) -> None: ...", pyi_1)
+        self.assertIn(
+            'def transform(xs: list[tuple[int, str]], opt: int | None = None, *, raw: bytes = b"\\x00\\xff") -> dict[str, list[str | None]]:',
+            pyi_1,
+        )
 
     def test_generated_c_compiles_warning_clean_against_315_abi3t(self) -> None:
         ir = parse_upstream_metadata_json(MANIFEST)
@@ -83,7 +103,11 @@ class TestCodegenGolden(unittest.TestCase):
         self.assertIn("nox_host_module_init__native", c_src)
         self.assertIn("METH_FASTCALL | METH_KEYWORDS", c_src)
         self.assertIn("noxpy_bind_fastcall_kwargs", c_src)
-        self.assertIn('Add \\"two\\" ints.\\nLine 2.', c_src)
+        self.assertIn("noxpy_py_to_host_value", c_src)
+        self.assertIn("noxpy_host_value_to_py", c_src)
+        self.assertIn('add($module, a, /, b)\\n--\\n\\nAdd \\"two\\" ints.\\nLine 2.', c_src)
+        self.assertIn('echo_bytes($module, *, payload)\\n--\\n\\n"', c_src)
+        self.assertIn('transform($module, xs, opt=None, *, raw=b\\"\\\\x00\\\\xff\\")\\n--\\n\\nPhase 2 containers and defaults.', c_src)
 
         py_inc = sysconfig.get_path("include")
         assert py_inc

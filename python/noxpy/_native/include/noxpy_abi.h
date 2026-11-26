@@ -55,6 +55,26 @@ typedef struct NoxPyHostOps {
     int64_t (*error_line)(const NoxHostError *err);
     NoxHostStatus (*error_class_name)(const NoxHostError *err, NoxHostSpan *out);
     NoxHostStatus (*error_message)(const NoxHostError *err, NoxHostSpan *out);
+    /* ---- ABI v2 (UR-008) value-tree operations ---- */
+    NoxHostStatus (*value_none)(NoxHostContext *ctx, NoxHostValue *out);
+    NoxHostStatus (*value_int)(NoxHostContext *ctx, int64_t v, NoxHostValue *out);
+    NoxHostStatus (*value_float)(NoxHostContext *ctx, double v, NoxHostValue *out);
+    NoxHostStatus (*value_bool)(NoxHostContext *ctx, uint8_t v, NoxHostValue *out);
+    NoxHostStatus (*value_str)(
+        NoxHostContext *ctx, const uint8_t *data, size_t len, int32_t is_bytes, NoxHostValue *out);
+    NoxHostStatus (*value_container)(NoxHostContext *ctx, int32_t kind, NoxHostValue *out);
+    NoxHostStatus (*value_append)(NoxHostContext *ctx, NoxHostValue container, NoxHostValue item);
+    NoxHostStatus (*value_dict_set)(
+        NoxHostContext *ctx, NoxHostValue dict, NoxHostValue key, NoxHostValue value);
+    NoxHostStatus (*value_kind)(NoxHostContext *ctx, NoxHostValue v, int32_t *out);
+    NoxHostStatus (*value_get_int)(NoxHostContext *ctx, NoxHostValue v, int64_t *out);
+    NoxHostStatus (*value_get_float)(NoxHostContext *ctx, NoxHostValue v, double *out);
+    NoxHostStatus (*value_get_span)(NoxHostContext *ctx, NoxHostValue v, NoxHostSpan *out);
+    NoxHostStatus (*value_len)(NoxHostContext *ctx, NoxHostValue v, size_t *out);
+    NoxHostStatus (*value_item)(NoxHostContext *ctx, NoxHostValue v, size_t index, NoxHostValue *out);
+    NoxHostStatus (*value_dict_entry)(
+        NoxHostContext *ctx, NoxHostValue v, size_t index, NoxHostValue *key_out, NoxHostValue *value_out);
+    NoxHostStatus (*value_release)(NoxHostContext *ctx, NoxHostValue v);
 } NoxPyHostOps;
 
 /*
@@ -140,6 +160,7 @@ void noxpy_set_exception_from_host(const NoxPyHostOps *ops, NoxHostStatus status
 typedef struct NoxPyParamSpec {
     const char *name;
     uint8_t kind;
+    uint8_t has_default;
 } NoxPyParamSpec;
 
 /*
@@ -155,6 +176,50 @@ int noxpy_bind_fastcall_kwargs(
     Py_ssize_t nargs,
     PyObject *kwnames,
     PyObject **bound_out);
+
+/*
+ * Phase 2 bounded container/optional snapshot converters with cycle detection & depth limits.
+ */
+#define NOXPY_MAX_CONV_DEPTH 32u
+#define NOXPY_DEFAULT_MAX_ITEMS 1000000u
+
+typedef struct NoxPyConvGuard {
+    size_t depth;
+    size_t max_depth;
+    size_t items;
+    size_t max_items;
+    const void *visited[NOXPY_MAX_CONV_DEPTH];
+} NoxPyConvGuard;
+
+void noxpy_conv_guard_init(NoxPyConvGuard *g, size_t max_depth, size_t max_items);
+int noxpy_conv_guard_enter(NoxPyConvGuard *g, const void *container_ptr, const char *arg_name);
+void noxpy_conv_guard_leave(NoxPyConvGuard *g);
+int noxpy_conv_guard_account(NoxPyConvGuard *g, size_t add_items, const char *arg_name);
+
+int noxpy_py_to_opt_i64_strict(PyObject *obj, int *has_value, int64_t *out, const char *arg_name);
+PyObject *noxpy_opt_i64_to_py(int has_value, int64_t val);
+
+int noxpy_py_validate_acyclic_tree(PyObject *obj, NoxPyConvGuard *g, const char *arg_name);
+int noxpy_py_list_i64_snapshot_strict(
+    PyObject *obj, NoxPyConvGuard *g, int64_t **out_buf, size_t *out_len, const char *arg_name);
+PyObject *noxpy_i64_array_to_py_list(const int64_t *buf, size_t len);
+void noxpy_free_buffer(void *p);
+PyObject *noxpy_py_dict_str_i64_roundtrip_strict(PyObject *obj, NoxPyConvGuard *g, const char *arg_name);
+
+/*
+ * ABI v2 (UR-008) recursive NoxHostValue <-> PyObject marshalers.
+ */
+int noxpy_py_to_host_value(
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    PyObject *obj,
+    const char *type_spec,
+    NoxHostValue *out_val,
+    const char *arg_name);
+PyObject *noxpy_host_value_to_py(
+    const NoxPyHostOps *ops,
+    NoxHostContext *ctx,
+    NoxHostValue val);
 
 #ifdef __cplusplus
 }

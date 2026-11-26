@@ -1,0 +1,52 @@
+# Genuine Nox unit tests for src.builder.lockfile (noxc test tests/nox).
+
+import nox.test
+from src.builder.lockfile import LockedPackage, parse_nox_lock_json
+from src.core.errors import NoxPyError
+
+VALID_LOCK: str = """{
+  "packages": [
+    {
+      "alias": "nyx",
+      "repo": "github.com/mburakmmm/nyx",
+      "ref": "v0.21.0",
+      "resolved": "1e7388a908aa2ca0fcfc2810f78ad88fbff82d77"
+    }
+  ]
+}"""
+
+pkgs: list[LockedPackage] = parse_nox_lock_json(VALID_LOCK, "nox.lock")
+nox.test.assert_eq_int(len(pkgs), 1, "one locked pkg")
+nox.test.assert_eq_str(pkgs[0].alias, "nyx", "alias")
+nox.test.assert_eq_str(pkgs[0].resolved, "1e7388a908aa2ca0fcfc2810f78ad88fbff82d77", "commit sha")
+
+empty_pkgs: list[LockedPackage] = parse_nox_lock_json("{}", "nox.lock")
+nox.test.assert_eq_int(len(empty_pkgs), 0, "empty lockfile")
+
+
+def _expect_lock_err(raw: str, label: str) -> None:
+    caught: bool = False
+    try:
+        parse_nox_lock_json(raw, "nox.lock")
+    except NoxPyError as e:
+        caught = True
+        nox.test.assert_eq_str(e.code, "NPY-E-CONFIG", label)
+    nox.test.assert_true(caught, label + " should fail")
+
+
+_expect_lock_err("{bad", "malformed json")
+_expect_lock_err('{"packages": "not-list"}', "packages not list")
+_expect_lock_err(
+    '{"packages": [{"alias": "nox", "repo": "r", "ref": "v1", "resolved": "1e7388a908"}]}',
+    "reserved alias nox",
+)
+_expect_lock_err(
+    '{"packages": [{"alias": "a", "repo": "r", "ref": "v1", "resolved": "main"}]}',
+    "unpinned branch instead of sha",
+)
+_expect_lock_err(
+    '{"packages": [{"alias": "a", "repo": "r", "ref": "v1", "resolved": "1e7388a"}, {"alias": "a", "repo": "r2", "ref": "v2", "resolved": "2e7388a"}]}',
+    "duplicate alias",
+)
+
+print("lockfile_test passed")

@@ -118,6 +118,41 @@ raw = b"\\x00\\x01\\xffnox"
 assert m.rt_bytes(raw) == raw
 try: m.rt_bytes("str"); raise AssertionError("expected TypeError")
 except TypeError: pass
+
+assert m.rt_opt_i64(None) is None
+assert m.rt_opt_i64(42) == 42
+try: m.rt_opt_i64(True); raise AssertionError("expected TypeError")
+except TypeError: pass
+
+assert m.rt_list_i64([]) == []
+assert m.rt_list_i64([1, -2, (1 << 62)]) == [1, -2, (1 << 62)]
+try: m.rt_list_i64([1, True]); raise AssertionError("expected TypeError")
+except TypeError: pass
+try: m.rt_list_i64((1, 2)); raise AssertionError("expected TypeError")
+except TypeError: pass
+
+assert m.rt_dict_str_i64({"a": 1, "b\\x00c": -7}) == {"a": 1, "b\\x00c": -7}
+try: m.rt_dict_str_i64({1: 2}); raise AssertionError("expected TypeError")
+except TypeError: pass
+try: m.rt_dict_str_i64({"a": True}); raise AssertionError("expected TypeError")
+except TypeError: pass
+
+cyc = []
+cyc.append(cyc)
+try: m.validate_tree(cyc); raise AssertionError("expected ValueError on cyclic list")
+except ValueError: pass
+
+d_cyc = {}
+d_cyc["self"] = d_cyc
+try: m.validate_tree(d_cyc); raise AssertionError("expected ValueError on cyclic dict")
+except ValueError: pass
+
+deep = 1
+for _ in range(35):
+    deep = [deep]
+try: m.validate_tree(deep); raise AssertionError("expected RecursionError on deep tree")
+except RecursionError: pass
+
 assert sys._is_gil_enabled() == gil_before, "extension mutated GIL state!"
 """
             env = dict(os.environ)

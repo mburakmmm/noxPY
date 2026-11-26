@@ -15,6 +15,9 @@ __all__: list[str] = [
     "is_c_keyword",
     "is_phase1_param_type",
     "is_phase1_return_type",
+    "is_supported_param_type",
+    "is_supported_return_type",
+    "marshal_for_type",
     "is_valid_param_kind",
     "is_valid_thread_policy",
     "parse_upstream_metadata_json",
@@ -22,6 +25,7 @@ __all__: list[str] = [
 ]
 
 IR_SCHEMA_VERSION: int = 1
+MAX_TYPE_NEST_DEPTH: int = 16
 
 
 class SourceSpan:
@@ -42,14 +46,38 @@ class ParamIR:
 
     name: str
     type_name: str
+    marshal: str
     kind: str
     has_default: bool
+    default_type: str
+    default_int: int
+    default_float: float
+    default_bool: bool
+    default_str: str
 
-    def __init__(self, name: str, type_name: str, kind: str, has_default: bool) -> None:
+    def __init__(
+        self,
+        name: str,
+        type_name: str,
+        marshal: str,
+        kind: str,
+        has_default: bool,
+        default_type: str,
+        default_int: int,
+        default_float: float,
+        default_bool: bool,
+        default_str: str,
+    ) -> None:
         self.name = name
         self.type_name = type_name
+        self.marshal = marshal
         self.kind = kind
         self.has_default = has_default
+        self.default_type = default_type
+        self.default_int = default_int
+        self.default_float = default_float
+        self.default_bool = default_bool
+        self.default_str = default_str
 
 
 class ExportedFunctionIR:
@@ -60,6 +88,7 @@ class ExportedFunctionIR:
     c_symbol: str
     params: list[ParamIR]
     return_type: str
+    return_marshal: str
     doc: str
     has_doc: bool
     thread_policy: str
@@ -72,6 +101,7 @@ class ExportedFunctionIR:
         c_symbol: str,
         params: list[ParamIR],
         return_type: str,
+        return_marshal: str,
         doc: str,
         has_doc: bool,
         thread_policy: str,
@@ -82,6 +112,7 @@ class ExportedFunctionIR:
         self.c_symbol = c_symbol
         self.params = params
         self.return_type = return_type
+        self.return_marshal = return_marshal
         self.doc = doc
         self.has_doc = has_doc
         self.thread_policy = thread_policy
@@ -219,6 +250,223 @@ def is_phase1_param_type(t: str) -> bool:
 
 def is_phase1_return_type(t: str) -> bool:
     return is_phase1_param_type(t) or t == "None"
+
+
+def _slice_bytes(s: str, start: int, end: int) -> str:
+    parts: list[str] = []
+    i: int = start
+    while i < end:
+        parts.append(nox.strings.char_from_byte(nox.strings.byte_at(s, i)))
+        i += 1
+    return nox.strings.join(parts, "")
+
+
+def _trim_ascii(s: str) -> str:
+    n: int = nox.strings.byte_len(s)
+    lo: int = 0
+    while lo < n and (nox.strings.byte_at(s, lo) == 32 or nox.strings.byte_at(s, lo) == 9):
+        lo += 1
+    hi: int = n
+    while hi > lo and (nox.strings.byte_at(s, hi - 1) == 32 or nox.strings.byte_at(s, hi - 1) == 9):
+        hi -= 1
+    return _slice_bytes(s, lo, hi)
+
+
+def _split_top_level_commas(inner: str, context: str, file: str, line: int, col: int) -> list[str]:
+    parts: list[str] = []
+    n: int = nox.strings.byte_len(inner)
+    depth: int = 0
+    seg_start: int = 0
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(inner, i)
+        if b == 91:  # '['
+            depth += 1
+        elif b == 93:  # ']'
+            if depth == 0:
+                raise make_error("NPY-E-TYPE", "Unbalanced ']' in " + context, file, line, col, "")
+            depth -= 1
+        elif b == 44 and depth == 0:  # ','
+            item: str = _trim_ascii(_slice_bytes(inner, seg_start, i))
+            if item == "":
+                raise make_error("NPY-E-TYPE", "Empty type element in " + context, file, line, col, "")
+            parts.append(item)
+            seg_start = i + 1
+        i += 1
+    if depth != 0:
+        raise make_error("NPY-E-TYPE", "Unbalanced '[' in " + context, file, line, col, "")
+    last_item: str = _trim_ascii(_slice_bytes(inner, seg_start, n))
+    if last_item == "":
+        raise make_error("NPY-E-TYPE", "Empty type element in " + context, file, line, col, "")
+    parts.append(last_item)
+    return parts
+
+
+def _is_dict_key_type(t: str) -> bool:
+    return t == "int" or t == "float" or t == "bool" or t == "str" or t == "bytes"
+
+
+def _classify_type_impl(
+    raw_t: str,
+    depth: int,
+    allow_none: bool,
+    in_container: bool,
+    file: str,
+    line: int,
+    col: int,
+) -> str:
+    if depth > MAX_TYPE_NEST_DEPTH:
+        raise make_error("NPY-E-TYPE", "Type nesting depth exceeds limit (16): '" + raw_t + "'", file, line, col, "")
+    t: str = _trim_ascii(raw_t)
+    n: int = nox.strings.byte_len(t)
+    if n == 0:
+        raise make_error("NPY-E-TYPE", "Empty type name is not supported", file, line, col, "")
+
+    if t == "None":
+        if not allow_none:
+            raise make_error("NPY-E-TYPE", "'None' is only supported as return type or 'T | None'", file, line, col, "")
+        return "none"
+
+    bdepth: int = 0
+    pipe_idx: int = -1
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(t, i)
+        if b == 91:
+            bdepth += 1
+        elif b == 93:
+            if bdepth == 0:
+                raise make_error("NPY-E-TYPE", "Unbalanced ']' in type '" + t + "'", file, line, col, "")
+            bdepth -= 1
+        elif b == 124 and bdepth == 0:  # '|'
+            if pipe_idx >= 0:
+                raise make_error("NPY-E-TYPE", "Unsupported multi-union type '" + t + "'", file, line, col, "")
+            pipe_idx = i
+        i += 1
+    if bdepth != 0:
+        raise make_error("NPY-E-TYPE", "Unbalanced '[' in type '" + t + "'", file, line, col, "")
+
+    if pipe_idx >= 0:
+        lhs: str = _trim_ascii(_slice_bytes(t, 0, pipe_idx))
+        rhs: str = _trim_ascii(_slice_bytes(t, pipe_idx + 1, n))
+        if rhs != "None" or lhs == "" or lhs == "None":
+            raise make_error("NPY-E-TYPE", "Only 'T | None' optional unions are supported, got '" + t + "'", file, line, col, "")
+        if in_container and (lhs == "int" or lhs == "float" or lhs == "bool"):
+            raise make_error(
+                "NPY-E-TYPE",
+                "Optional scalar '" + t + "' inside containers is not supported by upstream Host ABI",
+                file,
+                line,
+                col,
+                "",
+            )
+        # Validate inner non-None branch recursively; disallow nested Optional inside Optional.
+        _classify_type_impl(lhs, depth + 1, False, in_container, file, line, col)
+        if nox.strings.contains(lhs, "| None") and not nox.strings.starts_with(lhs, "list[") and not nox.strings.starts_with(lhs, "dict[") and not nox.strings.starts_with(lhs, "tuple["):
+            raise make_error("NPY-E-TYPE", "Nested optional unions are not supported: '" + t + "'", file, line, col, "")
+        return "value"
+
+    if t == "int" or t == "float" or t == "bool":
+        return "scalar"
+    if t == "str" or t == "bytes":
+        return "span"
+
+    if nox.strings.starts_with(t, "list[") and nox.strings.ends_with(t, "]"):
+        inner: str = _trim_ascii(_slice_bytes(t, 5, n - 1))
+        if inner == "":
+            raise make_error("NPY-E-TYPE", "Empty list element type in '" + t + "'", file, line, col, "")
+        _classify_type_impl(inner, depth + 1, False, True, file, line, col)
+        return "value"
+
+    if nox.strings.starts_with(t, "dict[") and nox.strings.ends_with(t, "]"):
+        inner_d: str = _trim_ascii(_slice_bytes(t, 5, n - 1))
+        dparts: list[str] = _split_top_level_commas(inner_d, t, file, line, col)
+        if len(dparts) != 2:
+            raise make_error("NPY-E-TYPE", "dict must have exactly 2 type arguments: '" + t + "'", file, line, col, "")
+        if not _is_dict_key_type(dparts[0]):
+            raise make_error(
+                "NPY-E-TYPE",
+                "dict key type '" + dparts[0] + "' must be int, float, bool, str, or bytes in '" + t + "'",
+                file,
+                line,
+                col,
+                "",
+            )
+        _classify_type_impl(dparts[1], depth + 1, False, True, file, line, col)
+        return "value"
+
+    if nox.strings.starts_with(t, "tuple[") and nox.strings.ends_with(t, "]"):
+        inner_t: str = _trim_ascii(_slice_bytes(t, 6, n - 1))
+        if inner_t == "":
+            raise make_error("NPY-E-TYPE", "Empty tuple[] is not supported", file, line, col, "")
+        tparts: list[str] = _split_top_level_commas(inner_t, t, file, line, col)
+        for ep in tparts:
+            if ep == "...":
+                raise make_error("NPY-E-TYPE", "Variadic tuple[...] is not supported: '" + t + "'", file, line, col, "")
+            _classify_type_impl(ep, depth + 1, False, True, file, line, col)
+        return "value"
+
+    raise make_error("NPY-E-TYPE", "Unsupported type '" + t + "'", file, line, col, "")
+
+
+def marshal_for_type(t: str, is_return: bool) -> str:
+    """Return Host ABI marshal kind ('scalar'|'span'|'value'|'none') or raise NPY-E-TYPE."""
+    return _classify_type_impl(t, 0, is_return, False, "", 0, 0)
+
+
+def is_supported_param_type(t: str) -> bool:
+    try:
+        _classify_type_impl(t, 0, False, False, "", 0, 0)
+        return True
+    except NoxPyError:
+        return False
+
+
+def is_supported_return_type(t: str) -> bool:
+    try:
+        _classify_type_impl(t, 0, True, False, "", 0, 0)
+        return True
+    except NoxPyError:
+        return False
+
+
+def _is_lower_or_upper_hex(s: str) -> bool:
+    n: int = nox.strings.byte_len(s)
+    if (n % 2) != 0:
+        return False
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(s, i)
+        ok: bool = (b >= 48 and b <= 57) or (b >= 97 and b <= 102) or (b >= 65 and b <= 70)
+        if not ok:
+            return False
+        i += 1
+    return True
+
+
+def _ascii_lower(s: str) -> str:
+    n: int = nox.strings.byte_len(s)
+    parts: list[str] = []
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(s, i)
+        if b >= 65 and b <= 90:
+            parts.append(nox.strings.char_from_byte(b + 32))
+        else:
+            parts.append(nox.strings.char_from_byte(b))
+        i += 1
+    return nox.strings.join(parts, "")
+
+
+def _is_optional_default_compatible(ptype: str, def_ty: str) -> bool:
+    if ptype == def_ty:
+        return True
+    if nox.strings.ends_with(ptype, " | None"):
+        if def_ty == "None":
+            return True
+        inner: str = _slice_bytes(ptype, 0, nox.strings.byte_len(ptype) - 7)
+        return inner == def_ty
+    return False
 
 
 def is_valid_param_kind(k: str) -> bool:
@@ -474,9 +722,23 @@ def parse_upstream_metadata_json(
         ret_pos: int = nox.json.pos_find(doc, entry_pos, "return_type")
         if ret_pos < 0 or nox.json.pos_kind(doc, ret_pos) != 3:
             raise make_error("NPY-E-TYPE", "Unsupported return type on '" + fn_name + "'", s_file, s_line, s_col, "")
-        ret_ty: str = nox.json.pos_str(doc, ret_pos)
-        if not is_phase1_return_type(ret_ty):
-            raise make_error("NPY-E-TYPE", "Unsupported return type '" + ret_ty + "' on '" + fn_name + "'", s_file, s_line, s_col, "")
+        ret_ty: str = _trim_ascii(nox.json.pos_str(doc, ret_pos))
+        ret_marshal: str = _classify_type_impl(ret_ty, 0, True, False, s_file, s_line, s_col)
+
+        rm_pos: int = nox.json.pos_find(doc, entry_pos, "return_marshal")
+        if rm_pos >= 0:
+            if nox.json.pos_kind(doc, rm_pos) != 3:
+                raise make_error("NPY-E-TYPE", "Invalid return_marshal on '" + fn_name + "'", s_file, s_line, s_col, "")
+            rm_val: str = nox.json.pos_str(doc, rm_pos)
+            if rm_val != ret_marshal:
+                raise make_error(
+                    "NPY-E-TYPE",
+                    "Return marshal mismatch for '" + fn_name + "': got '" + rm_val + "', expected '" + ret_marshal + "'",
+                    s_file,
+                    s_line,
+                    s_col,
+                    "",
+                )
 
         params_pos: int = nox.json.pos_find(doc, entry_pos, "params")
         if params_pos < 0 or nox.json.pos_kind(doc, params_pos) != 4:
@@ -485,6 +747,7 @@ def parse_upstream_metadata_json(
         params: list[ParamIR] = []
         seen_pnames: dict[str, bool] = {}
         seen_kw_only: bool = False
+        seen_pos_default: bool = False
         param_count: int = nox.json.pos_len(doc, params_pos)
         pidx: int = 0
         while pidx < param_count:
@@ -503,16 +766,23 @@ def parse_upstream_metadata_json(
             ptype_pos: int = nox.json.pos_find(doc, p_pos, "type")
             if ptype_pos < 0 or nox.json.pos_kind(doc, ptype_pos) != 3:
                 raise make_error("NPY-E-TYPE", "Unsupported parameter type for " + fn_name + "." + pname, s_file, s_line, s_col, "")
-            ptype: str = nox.json.pos_str(doc, ptype_pos)
-            if not is_phase1_param_type(ptype):
-                raise make_error(
-                    "NPY-E-TYPE",
-                    "Unsupported parameter type '" + ptype + "' for " + fn_name + "." + pname,
-                    s_file,
-                    s_line,
-                    s_col,
-                    "",
-                )
+            ptype: str = _trim_ascii(nox.json.pos_str(doc, ptype_pos))
+            pmarshal: str = _classify_type_impl(ptype, 0, False, False, s_file, s_line, s_col)
+
+            pm_pos: int = nox.json.pos_find(doc, p_pos, "marshal")
+            if pm_pos >= 0:
+                if nox.json.pos_kind(doc, pm_pos) != 3:
+                    raise make_error("NPY-E-TYPE", "Invalid marshal for " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                pm_val: str = nox.json.pos_str(doc, pm_pos)
+                if pm_val != pmarshal:
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Parameter marshal mismatch for " + fn_name + "." + pname + ": got '" + pm_val + "', expected '" + pmarshal + "'",
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
 
             pkind: str = "positional_or_keyword"
             pk_pos: int = nox.json.pos_find(doc, p_pos, "kind")
@@ -545,17 +815,97 @@ def parse_upstream_metadata_json(
                     has_default = nox.json.pos_number(doc, hd_pos) != 0.0
                 elif hd_kind == 3:
                     has_default = nox.json.pos_str(doc, hd_pos) != ""
-            if has_default:
-                raise make_error(
-                    "NPY-E-TYPE",
-                    "Default values are not yet supported in Phase 1 IR for " + fn_name + "." + pname,
-                    s_file,
-                    s_line,
-                    s_col,
-                    "",
-                )
 
-            params.append(ParamIR(pname, ptype, pkind, has_default))
+            if pkind != "keyword_only":
+                if has_default:
+                    seen_pos_default = True
+                elif seen_pos_default:
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Non-default parameter '" + pname + "' cannot follow parameter with default value in '" + fn_name + "'",
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
+
+            def_ty: str = ""
+            def_int: int = 0
+            def_float: float = 0.0
+            def_bool: bool = False
+            def_str: str = ""
+            if has_default:
+                def_pos: int = nox.json.pos_find(doc, p_pos, "default")
+                if def_pos < 0 or nox.json.pos_kind(doc, def_pos) != 5:
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Missing or non-constant default value metadata for " + fn_name + "." + pname,
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
+                dt_pos: int = nox.json.pos_find(doc, def_pos, "type")
+                if dt_pos < 0 or nox.json.pos_kind(doc, dt_pos) != 3:
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Missing default value type for " + fn_name + "." + pname,
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
+                def_ty = nox.json.pos_str(doc, dt_pos)
+                if not _is_optional_default_compatible(ptype, def_ty):
+                    raise make_error(
+                        "NPY-E-TYPE",
+                        "Default value type '" + def_ty + "' incompatible with parameter type '" + ptype + "' on " + fn_name + "." + pname,
+                        s_file,
+                        s_line,
+                        s_col,
+                        "",
+                    )
+                if def_ty == "None":
+                    dv_pos: int = nox.json.pos_find(doc, def_pos, "value")
+                    if dv_pos >= 0 and nox.json.pos_kind(doc, dv_pos) != 0:
+                        raise make_error("NPY-E-TYPE", "None default value must be null on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                elif def_ty == "bool":
+                    dv_pos2: int = nox.json.pos_find(doc, def_pos, "value")
+                    if dv_pos2 < 0 or nox.json.pos_kind(doc, dv_pos2) != 1:
+                        raise make_error("NPY-E-TYPE", "bool default value must be JSON bool on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    def_bool = nox.json.pos_bool(doc, dv_pos2)
+                elif def_ty == "int":
+                    dv_pos3: int = nox.json.pos_find(doc, def_pos, "value")
+                    if dv_pos3 < 0 or nox.json.pos_kind(doc, dv_pos3) != 2:
+                        raise make_error("NPY-E-TYPE", "int default value must be JSON int on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    try:
+                        def_int = nox.json.pos_int(doc, dv_pos3)
+                    except JsonError:
+                        raise make_error("NPY-E-TYPE", "int default out of int64 range on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                elif def_ty == "float":
+                    dv_pos4: int = nox.json.pos_find(doc, def_pos, "value")
+                    if dv_pos4 < 0 or nox.json.pos_kind(doc, dv_pos4) != 2:
+                        raise make_error("NPY-E-TYPE", "float default value must be JSON number on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    def_float = nox.json.pos_number(doc, dv_pos4)
+                    if (def_float - def_float) != 0.0:
+                        raise make_error("NPY-E-TYPE", "Non-finite float default not allowed on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                elif def_ty == "str":
+                    dv_pos5: int = nox.json.pos_find(doc, def_pos, "value")
+                    if dv_pos5 < 0 or nox.json.pos_kind(doc, dv_pos5) != 3:
+                        raise make_error("NPY-E-TYPE", "str default value must be JSON string on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    def_str = nox.json.pos_str(doc, dv_pos5)
+                elif def_ty == "bytes":
+                    hx_pos: int = nox.json.pos_find(doc, def_pos, "hex")
+                    if hx_pos < 0 or nox.json.pos_kind(doc, hx_pos) != 3:
+                        raise make_error("NPY-E-TYPE", "bytes default value must include 'hex' string on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    raw_hx: str = nox.json.pos_str(doc, hx_pos)
+                    if not _is_lower_or_upper_hex(raw_hx):
+                        raise make_error("NPY-E-TYPE", "Invalid hex string for bytes default on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+                    def_str = _ascii_lower(raw_hx)
+                else:
+                    raise make_error("NPY-E-TYPE", "Unsupported default value type '" + def_ty + "' on " + fn_name + "." + pname, s_file, s_line, s_col, "")
+
+            params.append(ParamIR(pname, ptype, pmarshal, pkind, has_default, def_ty, def_int, def_float, def_bool, def_str))
             pidx += 1
 
         doc_str: str = ""
@@ -578,6 +928,7 @@ def parse_upstream_metadata_json(
                 c_symbol,
                 params,
                 ret_ty,
+                ret_marshal,
                 doc_str,
                 has_doc,
                 thread_policy,
@@ -637,6 +988,8 @@ def module_ir_to_json(ir: ModuleIR) -> str:
         w.write_string(fn.c_symbol)
         w.write_key("return_type")
         w.write_string(fn.return_type)
+        w.write_key("return_marshal")
+        w.write_string(fn.return_marshal)
         w.write_key("thread_policy")
         w.write_string(fn.thread_policy)
         w.write_key("arity")

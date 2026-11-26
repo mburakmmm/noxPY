@@ -82,7 +82,13 @@ def _parse_requires_python_floor(spec: str, loc: DiagnosticLocation) -> tuple[in
 def _resolve_safe_relpath(project_root: Path, rel: str, field: str, loc: DiagnosticLocation) -> Path:
     if not isinstance(rel, str) or not rel.strip():
         raise NoxPyError("NPY-E-CONFIG", f"[tool.noxpy].{field} must be a non-empty relative path", location=loc)
-    candidate = Path(rel)
+    if rel.startswith(("/", "\\")) or (len(rel) >= 2 and rel[1] == ":"):
+        raise NoxPyError(
+            "NPY-E-CONFIG",
+            f"[tool.noxpy].{field} must be relative to project root, got {rel!r}",
+            location=loc,
+        )
+    candidate = Path(rel.replace("\\", "/"))
     if candidate.is_absolute():
         raise NoxPyError(
             "NPY-E-CONFIG",

@@ -1,0 +1,122 @@
+# Deterministic nox.lock validator in genuine Nox (packages.md §nox.lock).
+
+import nox.crypto
+import nox.fs
+import nox.json
+import nox.strings
+from nox.fs import FsError
+from nox.json import JsonError
+from src.core.errors import NoxPyError, make_error
+
+__all__: list[str] = ["LockedPackage", "parse_nox_lock_json", "load_nox_lock_digest"]
+
+
+class LockedPackage:
+    """Validated dependency lock entry from nox.lock."""
+
+    alias: str
+    repo: str
+    ref: str
+    resolved: str
+
+    def __init__(self, alias: str, repo: str, ref: str, resolved: str) -> None:
+        self.alias = alias
+        self.repo = repo
+        self.ref = ref
+        self.resolved = resolved
+
+
+def _is_hex_sha(s: str) -> bool:
+    n: int = nox.strings.byte_len(s)
+    if n < 7 or n > 64:
+        return False
+    i: int = 0
+    while i < n:
+        b: int = nox.strings.byte_at(s, i)
+        is_hex: bool = (b >= 48 and b <= 57) or (b >= 97 and b <= 102) or (b >= 65 and b <= 70)
+        if not is_hex:
+            return False
+        i += 1
+    return True
+
+
+def parse_nox_lock_json(raw_json: str, file: str) -> list[LockedPackage]:
+    """Parse and validate nox.lock entries against upstream Nox lockfile schema."""
+    doc: JsonValue = nox.json.parse("{}")
+    try:
+        doc = nox.json.parse(raw_json)
+    except JsonError as e:
+        raise make_error("NPY-E-CONFIG", "Invalid nox.lock JSON: " + e.message, file, 0, 0, "")
+
+    if not nox.json.is_object(doc):
+        raise make_error("NPY-E-CONFIG", "nox.lock root must be a JSON object", file, 0, 0, "")
+
+    root: int = nox.json.pos_root(doc)
+    pkgs_pos: int = nox.json.pos_find(doc, root, "packages")
+    if pkgs_pos < 0:
+        return []
+    if nox.json.pos_kind(doc, pkgs_pos) != 4:
+        raise make_error("NPY-E-CONFIG", "nox.lock 'packages' field must be an array", file, 0, 0, "")
+
+    seen_aliases: dict[str, bool] = {}
+    out: list[LockedPackage] = []
+    n: int = nox.json.pos_len(doc, pkgs_pos)
+    i: int = 0
+    while i < n:
+        ep: int = nox.json.pos_at(doc, pkgs_pos, i)
+        if nox.json.pos_kind(doc, ep) != 5:
+            raise make_error("NPY-E-CONFIG", "nox.lock package entry #" + str(i) + " must be an object", file, 0, 0, "")
+
+        ap: int = nox.json.pos_find(doc, ep, "alias")
+        rp: int = nox.json.pos_find(doc, ep, "repo")
+        rfp: int = nox.json.pos_find(doc, ep, "ref")
+        rsp: int = nox.json.pos_find(doc, ep, "resolved")
+
+        if ap < 0 or nox.json.pos_kind(doc, ap) != 3:
+            raise make_error("NPY-E-CONFIG", "nox.lock package #" + str(i) + " missing string 'alias'", file, 0, 0, "")
+        if rp < 0 or nox.json.pos_kind(doc, rp) != 3:
+            raise make_error("NPY-E-CONFIG", "nox.lock package #" + str(i) + " missing string 'repo'", file, 0, 0, "")
+        if rfp < 0 or nox.json.pos_kind(doc, rfp) != 3:
+            raise make_error("NPY-E-CONFIG", "nox.lock package #" + str(i) + " missing string 'ref'", file, 0, 0, "")
+        if rsp < 0 or nox.json.pos_kind(doc, rsp) != 3:
+            raise make_error("NPY-E-CONFIG", "nox.lock package #" + str(i) + " missing string 'resolved' commit SHA", file, 0, 0, "")
+
+        alias: str = nox.json.pos_str(doc, ap)
+        repo: str = nox.json.pos_str(doc, rp)
+        ref: str = nox.json.pos_str(doc, rfp)
+        resolved: str = nox.json.pos_str(doc, rsp)
+
+        if alias == "" or alias == "nox":
+            raise make_error("NPY-E-CONFIG", "Invalid nox.lock package alias: '" + alias + "'", file, 0, 0, "")
+        if alias in seen_aliases:
+            raise make_error("NPY-E-CONFIG", "Duplicate nox.lock package alias: '" + alias + "'", file, 0, 0, "")
+        seen_aliases[alias] = True
+
+        if repo == "" or ref == "":
+            raise make_error("NPY-E-CONFIG", "Empty repo/ref for nox.lock package '" + alias + "'", file, 0, 0, "")
+        if not _is_hex_sha(resolved):
+            raise make_error(
+                "NPY-E-CONFIG",
+                "nox.lock package '" + alias + "' resolved commit must be hex SHA: '" + resolved + "'",
+                file,
+                0,
+                0,
+                "",
+            )
+
+        out.append(LockedPackage(alias, repo, ref, resolved))
+        i += 1
+    return out
+
+
+def load_nox_lock_digest(path: str) -> str:
+    """Validate nox.lock if present and return SHA-256 hex digest (or 'none')."""
+    if not nox.fs.exists(path):
+        return "none"
+    raw: str = ""
+    try:
+        raw = nox.fs.read_to_string(path)
+    except FsError as e:
+        raise make_error("NPY-E-CONFIG", "Unable to read nox.lock: " + e.message, path, 0, 0, "")
+    parse_nox_lock_json(raw, path)
+    return nox.crypto.sha256(raw)

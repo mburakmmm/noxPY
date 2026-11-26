@@ -67,17 +67,17 @@
 
 ---
 
-## Phase 2 — `0.2`: Types and Packaging (Next Active Phase)
-- [ ] Implement `T | None`, `list[T]`, `dict[K, V]`, `tuple` conversions with cycle detection, depth/size limits, and bounded synchronization.
-- [ ] Generate deterministic `.pyi` type stubs and `py.typed` (PEP 561) from Binding IR + `noxpy generate-stubs`.
-- [ ] Support docstrings, `__module__`, `__text_signature__`, and mixed Python/native package layouts (`examples/mixed_package`).
-- [ ] Complete PEP 517 (`build_sdist`, `get_requires_*`, `prepare_metadata_*`) and PEP 660 (`build_editable`).
-- [ ] Implement `nox.lock` resolution, deterministic build cache, `SOURCE_DATE_EPOCH` reproducibility, `noxpy check`, `noxpy init`, `noxpy clean`.
-- [ ] Add fuzz/property tests for converters, IR parser, and isolated sdist -> wheel builds in `pip` and `uv`.
+## Phase 2 — `0.2`: Types and Packaging (Complete — `2026-11-26` on `noxc v2.2.87` + `CPython 3.15.2` & `3.15.0b3t`)
+- [x] **Verified (`UR-008` resolved in `noxc v2.2.85–v2.2.87`):** End-to-end `NoxHostValue` (ABI v2) marshaling for `T | None`, `list[T]`, `dict[K, V]`, `tuple[...]`, nested combinations (`list[tuple[int, str]]`, `dict[str, list[str | None]]`), constant parameter defaults (`int`, `float`, `bool`, `str`, `None`), cycle/depth guards (`NOXPY_MAX_CONV_DEPTH = 32`), atomic container snapshots (`PySequence_Tuple`, `PyDict_Items`), and 8-thread `3.15t` stress + concurrent mutation safety ([`native/cpython/noxpy_shim.c`](native/cpython/noxpy_shim.c), [`examples/mixed_package/`](examples/mixed_package/), [`docs/evidence/phase2-2026-11-26.md`](docs/evidence/phase2-2026-11-26.md)).
+- [x] Generate deterministic `.pyi` type stubs and `py.typed` (PEP 561) from Binding IR + `noxpy generate-stubs` (including `--check`).
+- [x] Support docstrings, `__text_signature__` (`inspect.signature` PEP 457 format with defaults), and mixed Python/native package layouts ([`examples/mixed_package`](examples/mixed_package/)).
+- [x] Complete PEP 517 (`build_sdist`, `get_requires_*`, `prepare_metadata_*`) and PEP 660 (`build_editable`, `get_requires_for_build_editable`, `prepare_metadata_for_build_editable`).
+- [x] Implement `nox.lock` validation ([`src/builder/lockfile.nox`](src/builder/lockfile.nox), [`python/noxpy/lockfile.py`](python/noxpy/lockfile.py)), deterministic `.noxpy-cache`, `SOURCE_DATE_EPOCH` reproducibility, `noxpy check`, `noxpy init`, `noxpy clean`.
+- [x] Add seeded fuzz/property tests for converters, IR parser, lockfile, and `pyproject.toml` (`tests/fuzz/`) plus isolated `sdist -> wheel` & PEP 660 editable tests in `uv` (`tests/packaging/test_phase2_packaging.py`).
 
 ---
 
-## Phase 3 — `0.3`: Native Objects & Classes (Locked behind Phase 2)
+## Phase 3 — `0.3`: Native Objects & Classes (Unlocked — Next)
 - [ ] Implement CPython 3.15 heap types (`PyType_FromMetaclass` / `PyType_FromModuleAndSpec` / slots) with interpreter-local type objects (`ADR-005`).
 - [ ] Implement generation-checked opaque handle table (`UR-006`) rejecting cross-interpreter use, ABA wrap, and use-after-close.
 - [ ] Implement `@pyclass`, `@pymethod`, `@pyproperty`, `@pystaticmethod`, `@pyclassmethod`, `@pyexception`, constructors, `__repr__`, and rich comparisons (`NotImplemented`).

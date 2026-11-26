@@ -1,6 +1,7 @@
 # Build & temporary artifacts
 build/
 dist/
+.noxpy-cache/
 *.egg-info/
 experiments/phase0_poc/build/
 *.o

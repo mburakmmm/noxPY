@@ -241,7 +241,7 @@ jobs:
           PY_INC="$("${{ steps.py_gil.outputs.python-path }}" -c "import sysconfig; print(sysconfig.get_path('include'))")"
           NOX_INC="$HOME/.nox-lang/include"
           NOXRT="$HOME/.nox-lang/lib/noxrt.o"
-          noxc build --backend llvm --host-abi --module-name hello --emit-obj -o "$WORK/hello_nox.o" "$WORK/hello/src/lib.nox"
+          noxc build --backend llvm --host-abi --module-name hello --emit-obj -o "$WORK/hello_nox.o" "$WORK/hello/src/hello.nox"
           "${{ steps.py_gil.outputs.python-path }}" -m noxpy generate-stubs "$WORK/hello" --emit-c > "$WORK/hello_adapter.c"
           clang -std=c11 -O1 -g -Wall -Wextra -Werror -fPIC -fvisibility=hidden \
             -fsanitize=undefined -fno-omit-frame-pointer -fno-sanitize-recover=all \
@@ -301,7 +301,8 @@ jobs:
           New-Item -ItemType Directory -Path $work | Out-Null
           Copy-Item -Recurse "examples\hello" "$work\hello"
           & "${{ steps.py_gil.outputs.python-path }}" -m noxpy build "$work\hello" --out-dir "$work\dist" --release --json
-          $whl = (Get-ChildItem "$work\dist\hello-*-cp315-abi3.abi3t-win_amd64.whl" | Select-Object -First 1).FullName
+          if ($LASTEXITCODE -ne 0) { throw "noxpy build failed (exit $LASTEXITCODE)" }
+          $whl = (Get-ChildItem "$work\dist\*-cp315-abi3.abi3t-win_amd64.whl" | Select-Object -First 1).FullName
           if (-not $whl) { throw "Expected win_amd64 dual-tag wheel not found" }
           foreach ($pair in @(@("315", "${{ steps.py_gil.outputs.python-path }}", "True"), @("315t", "${{ steps.py_ft.outputs.python-path }}", "False"))) {
             $lbl = $pair[0]; $py = $pair[1]; $expGil = $pair[2]
@@ -309,6 +310,7 @@ jobs:
             uv venv --quiet --python $py $vdir
             uv pip install --quiet --python "$vdir\Scripts\python.exe" $whl
             & "$vdir\Scripts\python.exe" -c "import sys, hello; assert sys._is_gil_enabled() is $expGil; assert hello.add(20, 22) == 42; assert sys._is_gil_enabled() is $expGil; print('WIN_PYD_OK', sys._is_gil_enabled())"
+            if ($LASTEXITCODE -ne 0) { throw "Windows .pyd verification failed on $lbl (exit $LASTEXITCODE)" }
           }
 
   ci-summary:

@@ -532,8 +532,10 @@ def _compile_and_audit_extension(
                     f"Missing Windows stable ABI import library: {py3_lib}",
                     hint="Ensure CPython 3.15+ Windows install includes libs/python3.lib.",
                 )
+            has_lld = bool(shutil.which("lld-link") or Path(cc).with_name("lld-link.exe").is_file())
             link_cmd = [
                 cc,
+                *(["-fuse-ld=lld"] if has_lld else []),
                 "-shared",
                 "-o",
                 str(so_path),
@@ -573,9 +575,10 @@ def _compile_and_audit_extension(
 
         res_ld = subprocess.run(link_cmd, capture_output=True, text=True)
         if res_ld.returncode != 0:
+            detail = "\n".join(p for p in (res_ld.stderr.strip(), res_ld.stdout.strip()) if p)
             raise NoxPyError(
                 "NPY-E-ABI",
-                f"Extension linking failed:\n{res_ld.stderr.strip() or res_ld.stdout.strip()}",
+                f"Extension linking failed:\n{detail}",
             )
 
         audit = audit_extension_binary(so_path, f"PyModExport_{cfg.leaf_name}")

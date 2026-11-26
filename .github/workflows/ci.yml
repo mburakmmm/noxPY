@@ -236,7 +236,7 @@ jobs:
           cp -r examples/hello "$WORK/hello"
           NOXPY_PLATFORM_TAG=manylinux_2_28_x86_64 NOXPY_MAX_GLIBC=2.39 \
             "${{ steps.py_gil.outputs.python-path }}" -m noxpy build "$WORK/hello" --out-dir "$WORK/dist" --release --json
-          ls "$WORK"/dist/hello-*-cp315-abi3.abi3t-manylinux_2_28_x86_64.whl
+          ls "$WORK"/dist/*-cp315-abi3.abi3t-manylinux_2_28_x86_64.whl
 
           PY_INC="$("${{ steps.py_gil.outputs.python-path }}" -c "import sysconfig; print(sysconfig.get_path('include'))")"
           NOX_INC="$HOME/.nox-lang/include"

@@ -330,7 +330,7 @@ def _audit_windows(pyd_path: Path, expected_symbol: str, loc: DiagnosticLocation
                         location=loc,
                     )
                 is_py_dll = low_dll.startswith("python") and low_dll.endswith(".dll")
-                if is_py_dll and low_dll != "python3.dll":
+                if is_py_dll and low_dll not in ("python3.dll", "python3t.dll"):
                     bad_py_dlls.append(dll_name)
 
                 thunk_rva = orig_ft if orig_ft else ft
@@ -352,7 +352,7 @@ def _audit_windows(pyd_path: Path, expected_symbol: str, loc: DiagnosticLocation
     if bad_py_dlls:
         raise NoxPyError(
             "NPY-E-ABI",
-            f"Windows abi3t extension must link python3.dll (stable ABI), not version-specific {bad_py_dlls}",
+            f"Windows abi3/abi3t extension must link python3.dll or python3t.dll, not version-specific {bad_py_dlls}",
             location=loc,
         )
 

@@ -87,17 +87,18 @@ def _build_synthetic_pe32plus(
 
 class TestWindowsPEAudit(unittest.TestCase):
     def test_valid_abi3t_pyd_passes(self) -> None:
-        pe = _build_synthetic_pe32plus(
-            exports=["PyModExport_hello"],
-            imports={"python3.dll": ["PyABIInfo_Check", "PyLong_FromInt64"], "KERNEL32.dll": ["GetCurrentThreadId"]},
-        )
-        with tempfile.TemporaryDirectory() as td:
-            p = Path(td) / "hello.pyd"
-            p.write_bytes(pe)
-            exps, psyms, deps = _audit_windows(p, "PyModExport_hello", DiagnosticLocation(file=str(p)))
-            self.assertEqual(exps, ["PyModExport_hello"])
-            self.assertEqual(psyms, ["PyABIInfo_Check", "PyLong_FromInt64"])
-            self.assertIn("python3.dll", deps)
+        for py_dll in ("python3.dll", "python3t.dll"):
+            pe = _build_synthetic_pe32plus(
+                exports=["PyModExport_hello"],
+                imports={py_dll: ["PyABIInfo_Check", "PyLong_FromInt64"], "KERNEL32.dll": ["GetCurrentThreadId"]},
+            )
+            with tempfile.TemporaryDirectory() as td:
+                p = Path(td) / "hello.pyd"
+                p.write_bytes(pe)
+                exps, psyms, deps = _audit_windows(p, "PyModExport_hello", DiagnosticLocation(file=str(p)))
+                self.assertEqual(exps, ["PyModExport_hello"])
+                self.assertEqual(psyms, ["PyABIInfo_Check", "PyLong_FromInt64"])
+                self.assertIn(py_dll, deps)
 
     def test_rejects_versioned_python_dll(self) -> None:
         pe = _build_synthetic_pe32plus(

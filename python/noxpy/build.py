@@ -525,12 +525,14 @@ def _compile_and_audit_extension(
                 "-lm",
             ]
         elif sys.platform == "win32":
-            py3_lib = Path(sys.base_prefix) / "libs" / "python3.lib"
+            gil_disabled = hasattr(sys, "_is_gil_enabled") and not sys._is_gil_enabled()
+            lib_name = "python3t.lib" if gil_disabled else "python3.lib"
+            py3_lib = Path(sys.base_prefix) / "libs" / lib_name
             if not py3_lib.is_file():
                 raise NoxPyError(
                     "NPY-E-ABI",
                     f"Missing Windows stable ABI import library: {py3_lib}",
-                    hint="Ensure CPython 3.15+ Windows install includes libs/python3.lib.",
+                    hint=f"Ensure CPython 3.15+ Windows install includes libs/{lib_name}.",
                 )
             has_lld = bool(shutil.which("lld-link") or Path(cc).with_name("lld-link.exe").is_file())
             link_cmd = [
